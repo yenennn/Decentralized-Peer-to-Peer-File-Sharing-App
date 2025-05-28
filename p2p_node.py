@@ -1,6 +1,6 @@
 """
-Main P2P node implementation.
-Handles peer connections, NAT traversal, and file transfers.
+Main P2P node implementation with QUIC file transfer.
+Handles peer connections, NAT traversal using STUN, and QUIC-based file transfers.
 """
 import os
 import socket
@@ -11,6 +11,7 @@ import threading
 import uuid
 import base64
 import queue
+import asyncio
 from typing import Dict, List, Tuple, Optional, Callable, Any
 
 from stun_client import STUNClient
@@ -23,22 +24,24 @@ logger = logging.getLogger(__name__)
 
 class P2PNode:
     """
-    P2P node for decentralized file sharing.
-    Handles NAT traversal, peer connections, and file transfers.
+    P2P node for decentralized file sharing with QUIC.
+    Handles NAT traversal with STUN, peer connections, and QUIC-based file transfers.
     """
 
-    def __init__(self, local_port: int = 0, save_dir: str = "./downloads"):
+    def __init__(self, local_port: int = 0, quic_port: int = 0, save_dir: str = "./downloads"):
         """
         Initialize the P2P node.
 
         Args:
-            local_port: Local UDP port to bind to. If 0, a random port will be assigned.
+            local_port: Local UDP port for peer discovery. If 0, a random port will be assigned.
+            quic_port: Local port for QUIC file transfers. If 0, a random port will be assigned.
             save_dir: Directory to save received files
         """
         self.node_id = str(uuid.uuid4())
         self.local_port = local_port
+        self.quic_port = quic_port if quic_port != 0 else (local_port + 1000 if local_port != 0 else 4433)
         self.save_dir = os.path.abspath(save_dir)
-        self.peers = {}  # {peer_id: {addr: (ip, port), public_key: key}}
+        self.peers = {}  # {peer_id: {addr: (ip, port), quic_port: port, public_key: key}}
         self.running = False
         self.stun_client = STUNClient(local_port)
         self.crypto_manager = CryptoManager()
@@ -53,34 +56,39 @@ class P2PNode:
         self.nat_type = None
         self.external_ip = None
         self.external_port = None
+        self.external_quic_port = None
 
-        # Track expected binary data
-        self.expecting_binary = False
-        self.expected_chunk_size = 0
-        self.expected_transfer_id = None
-        self.expected_chunk_index = None
+        # QUIC event loop
+        self.quic_loop = None
+        self.quic_thread = None
 
-    def start(self) -> Tuple[str, int]:
+    def start(self) -> Tuple[str, int, int]:
         """
         Start the P2P node.
 
         Returns:
-            Tuple of (external_ip, external_port)
+            Tuple of (external_ip, external_port, quic_port)
         """
-        # Discover NAT type and external IP/port
+        # Discover NAT type and external IP/port using STUN
         self.nat_type, self.external_ip, self.external_port = self.stun_client.discover_nat()
 
         if not self.external_ip or not self.external_port:
             raise RuntimeError("Failed to discover external IP and port")
 
-        # Create UDP socket
+        # Create UDP socket for peer discovery
         self.socket = self.stun_client.create_socket()
 
-        # Initialize file transfer manager
-        self.file_transfer = FileTransfer(self.socket, self.crypto_manager)
+        # Calculate external QUIC port (assumption: same NAT mapping offset)
+        self.external_quic_port = self.external_port + (self.quic_port - self.local_port)
+
+        # Initialize QUIC-based file transfer manager
+        self.file_transfer = FileTransfer(self.crypto_manager)
         self.file_transfer.receive_file(self.save_dir, self._on_transfer_progress)
 
-        # Start message handling thread
+        # Start QUIC server in a separate thread
+        self._start_quic_server()
+
+        # Start message handling thread for peer discovery
         self.running = True
         self.message_thread = threading.Thread(target=self._handle_messages)
         self.message_thread.daemon = True
@@ -89,33 +97,73 @@ class P2PNode:
         logger.info(f"P2P node started with ID: {self.node_id}")
         logger.info(f"NAT Type: {self.nat_type}")
         logger.info(f"External IP: {self.external_ip}")
-        logger.info(f"External Port: {self.external_port}")
-        logger.info(f"Local Port: {self.local_port}")
+        logger.info(f"External Port (UDP): {self.external_port}")
+        logger.info(f"External QUIC Port: {self.external_quic_port}")
+        logger.info(f"Local Port (UDP): {self.local_port}")
+        logger.info(f"Local QUIC Port: {self.quic_port}")
 
-        return self.external_ip, self.external_port
+        return self.external_ip, self.external_port, self.external_quic_port
+
+    def _start_quic_server(self):
+        """Start the QUIC server in a separate thread"""
+        def run_quic_server():
+            self.quic_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.quic_loop)
+
+            try:
+                # Start QUIC server
+                self.quic_loop.run_until_complete(
+                    self.file_transfer.start_server(self.quic_port)
+                )
+                # Keep the loop running
+                self.quic_loop.run_forever()
+            except Exception as e:
+                logger.error(f"QUIC server error: {e}")
+            finally:
+                self.quic_loop.close()
+
+        self.quic_thread = threading.Thread(target=run_quic_server, daemon=True)
+        self.quic_thread.start()
+
+        # Wait a bit for server to start
+        time.sleep(1)
 
     def stop(self) -> None:
         """Stop the P2P node"""
         self.running = False
+
+        # Stop QUIC server
+        if self.quic_loop and self.quic_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.file_transfer.stop_server(self.quic_port),
+                self.quic_loop
+            )
+            self.quic_loop.call_soon_threadsafe(self.quic_loop.stop)
+
         if self.socket:
             self.socket.close()
         logger.info("P2P node stopped")
 
-    def connect_to_peer(self, peer_id: str, peer_ip: str, peer_port: int) -> bool:
+    def connect_to_peer(self, peer_id: str, peer_ip: str, peer_port: int, peer_quic_port: int = None) -> bool:
         """
-        Connect to a peer using their external IP and port.
+        Connect to a peer using their external IP and ports.
 
         Args:
             peer_id: Unique identifier for the peer
             peer_ip: External IP of the peer
-            peer_port: External port of the peer
+            peer_port: External UDP port of the peer (for discovery)
+            peer_quic_port: External QUIC port of the peer (for file transfer)
 
         Returns:
             True if connection was successful, False otherwise
         """
-        logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_port}")
+        if peer_quic_port is None:
+            # Assume same offset as this node
+            peer_quic_port = peer_port + (self.quic_port - self.local_port)
 
-        # Perform UDP hole punching
+        logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_port} (QUIC: {peer_quic_port})")
+
+        # Perform UDP hole punching for discovery
         if not self.stun_client.punch_hole(peer_ip, peer_port):
             logger.error(f"Failed to punch hole to {peer_ip}:{peer_port}")
             return False
@@ -123,16 +171,18 @@ class P2PNode:
         # Store peer information
         self.peers[peer_id] = {
             'addr': (peer_ip, peer_port),
+            'quic_port': peer_quic_port,
             'public_key': None,
             'connected': False,
             'last_seen': time.time()
         }
 
-        # Send hello message with our public key
+        # Send hello message with our public key and QUIC port
         hello_msg = {
             'type': 'hello',
             'node_id': self.node_id,
-            'public_key': self.crypto_manager.get_public_key_pem().decode()
+            'public_key': self.crypto_manager.get_public_key_pem().decode(),
+            'quic_port': self.external_quic_port
         }
 
         hello_json = json.dumps(hello_msg).encode()
@@ -151,7 +201,8 @@ class P2PNode:
                     hello_msg = {
                         'type': 'hello',
                         'node_id': self.node_id,
-                        'public_key': self.crypto_manager.get_public_key_pem().decode()
+                        'public_key': self.crypto_manager.get_public_key_pem().decode(),
+                        'quic_port': self.external_quic_port
                     }
                     hello_json = json.dumps(hello_msg).encode()
                     self.socket.sendto(hello_json, (peer_ip, peer_port))
@@ -167,14 +218,11 @@ class P2PNode:
         retry_thread.daemon = True
         retry_thread.start()
 
-        # We'll wait for the response in the message handling thread
-        # The connection will be marked as successful when we receive a hello_ack
-
         return True
 
     def send_file(self, peer_id: str, file_path: str) -> Optional[str]:
         """
-        Send a file to a peer.
+        Send a file to a peer using QUIC.
 
         Args:
             peer_id: Unique identifier for the peer
@@ -187,26 +235,36 @@ class P2PNode:
             logger.error(f"Peer {peer_id} is not connected")
             return None
 
-        peer_addr = self.peers[peer_id]['addr']
+        peer_info = self.peers[peer_id]
+        peer_quic_addr = (peer_info['addr'][0], peer_info['quic_port'])
 
         try:
-            transfer_id = self.file_transfer.send_file(
-                file_path,
-                peer_id,
-                peer_addr,
-                self._on_transfer_progress
-            )
+            # Use asyncio to send the file
+            if self.quic_loop and self.quic_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self.file_transfer.send_file(
+                        file_path,
+                        peer_id,
+                        peer_quic_addr,
+                        self._on_transfer_progress
+                    ),
+                    self.quic_loop
+                )
 
-            logger.info(f"Started file transfer {transfer_id} to peer {peer_id}")
-            return transfer_id
+                transfer_id = future.result(timeout=30)
+                logger.info(f"Started QUIC file transfer {transfer_id} to peer {peer_id}")
+                return transfer_id
+            else:
+                logger.error("QUIC loop not running")
+                return None
 
         except Exception as e:
-            logger.error(f"Error sending file: {e}")
+            logger.error(f"Error sending file via QUIC: {e}")
             return None
 
     def send_message(self, peer_id: str, message: str) -> bool:
         """
-        Send a simple text message to a peer.
+        Send a simple text message to a peer via UDP.
 
         Args:
             peer_id: Unique identifier for the peer
@@ -254,32 +312,13 @@ class P2PNode:
 
         transfer = self.file_transfer.transfers[transfer_id]
 
-        # Calculate progress percentage
-        if transfer['total_chunks'] > 0:
-            if 'chunks_sent' in transfer:
-                progress = (transfer['chunks_sent'] / transfer['total_chunks']) * 100
-            else:
-                progress = (transfer['chunks_received'] / transfer['total_chunks']) * 100
-        else:
-            progress = 0
-
-        # Calculate transfer speed
-        if transfer['status'] == 'completed' and 'end_time' in transfer and 'start_time' in transfer:
-            duration = transfer['end_time'] - transfer['start_time']
-            if duration > 0:
-                speed = transfer['file_size'] / duration / 1024  # KB/s
-            else:
-                speed = 0
-        else:
-            speed = 0
-
         return {
             'transfer_id': transfer_id,
             'file_name': transfer['file_name'],
             'file_size': transfer['file_size'],
-            'status': transfer['status'],
-            'progress': progress,
-            'speed': speed
+            'status': transfer.get('status', 'unknown'),
+            'progress': 100,  # QUIC handles reliability, so assume complete when done
+            'speed': 0  # Could be calculated if needed
         }
 
     def get_peer_info(self) -> Dict:
@@ -293,14 +332,15 @@ class P2PNode:
             'node_id': self.node_id,
             'external_ip': self.external_ip,
             'external_port': self.external_port,
+            'external_quic_port': self.external_quic_port,
             'nat_type': self.nat_type
         }
 
     def _handle_messages(self) -> None:
-        """Handle incoming messages in a loop"""
+        """Handle incoming UDP messages for peer discovery"""
         while self.running:
             try:
-                data, addr = self.socket.recvfrom(65536)  # Max UDP packet size
+                data, addr = self.socket.recvfrom(65536)
 
                 # First identify the peer based on address
                 peer_id = None
@@ -309,101 +349,38 @@ class P2PNode:
                         peer_id = pid
                         break
 
-                # If we're expecting binary data, process it directly
-                if self.expecting_binary:
-                    # Reset the flag immediately
-                    self.expecting_binary = False
-
-                    if peer_id and self.expected_transfer_id is not None and self.expected_chunk_index is not None:
-                        logger.debug(
-                            f"Processing expected binary chunk data for transfer {self.expected_transfer_id}, chunk {self.expected_chunk_index}")
-
-                        # Process the binary data directly
-                        self.file_transfer._process_chunk(
-                            self.expected_transfer_id,
-                            self.expected_chunk_index,
-                            peer_id,
-                            addr,
-                            data
-                        )
-
-                        # Clear the expected values
-                        self.expected_transfer_id = None
-                        self.expected_chunk_index = None
-                        self.expected_chunk_size = 0
-                    else:
-                        logger.warning(f"Received binary data but missing context information")
-
-                    continue  # Skip further processing for expected binary data
-
-                # For all other data, first check if it looks like text/JSON
+                # Try to decode as JSON for control messages
                 try:
-                    # Try to decode as UTF-8
                     text_data = data.decode('utf-8')
+                    message = json.loads(text_data)
+                    message_type = message.get('type')
 
-                    # Try to parse as JSON
-                    try:
-                        message = json.loads(text_data)
-                        message_type = message.get('type')
-
-                        # Handle known message types
-                        if message_type == 'hello':
-                            self._handle_hello(message, addr)
-                        elif message_type == 'hello_ack':
-                            self._handle_hello_ack(message, addr)
-                        elif message_type == 'key_exchange':
-                            self._handle_key_exchange(message, addr)
-                        elif message_type == 'key_exchange_ack':
-                            self._handle_key_exchange_ack(message, addr)
-                        elif message_type == 'file_chunk':
-                            # Set up to receive binary data next
-                            self.expecting_binary = True
-                            self.expected_chunk_size = message.get('chunk_size', 0)
-                            self.expected_transfer_id = message.get('transfer_id')
-                            self.expected_chunk_index = message.get('chunk_index')
-
-                            if peer_id:
-                                # Store the chunk header information
-                                self.file_transfer._handle_file_chunk(message, addr, peer_id)
-                                logger.debug(
-                                    f"Received header for chunk {self.expected_chunk_index} of transfer {self.expected_transfer_id}")
-                            else:
-                                logger.warning(f"Received file chunk from unknown peer {addr}")
-                        elif message_type == 'test_message':
-                            # Handle test message
-                            peer_id_from = message.get('from', None)
-                            msg_text = message.get('message', '')
-                            if peer_id_from:
-                                self.incoming_messages.put({'peer_id': peer_id_from, 'message': msg_text})
-                            else:
-                                logger.info(f"Received test message from unknown peer: {addr}")
-                        elif peer_id:
-                            # Handle other file transfer related messages by passing raw data
-                            # This includes: file_init, file_init_ack, chunk_ack, window_ack, selective_nack, file_end, file_end_ack
-                            self.file_transfer.handle_message(data, addr, peer_id)
+                    # Handle known message types
+                    if message_type == 'hello':
+                        self._handle_hello(message, addr)
+                    elif message_type == 'hello_ack':
+                        self._handle_hello_ack(message, addr)
+                    elif message_type == 'key_exchange':
+                        self._handle_key_exchange(message, addr)
+                    elif message_type == 'key_exchange_ack':
+                        self._handle_key_exchange_ack(message, addr)
+                    elif message_type == 'test_message':
+                        # Handle test message
+                        peer_id_from = message.get('from', None)
+                        msg_text = message.get('message', '')
+                        if peer_id_from:
+                            self.incoming_messages.put({'peer_id': peer_id_from, 'message': msg_text})
                         else:
-                            logger.warning(f"Received message from unknown peer {addr}: {message_type}")
-
-                    except json.JSONDecodeError:
-                        # Valid UTF-8 but not JSON - might be a text protocol message
-                        logger.debug(f"Received non-JSON text from {addr}: {text_data[:100]}...")
-                        if peer_id:
-                            # Pass to file transfer handler as raw bytes
-                            self.file_transfer.handle_message(data, addr, peer_id)
-
-                except UnicodeDecodeError:
-                    # This is binary data that can't be decoded as UTF-8
-                    logger.debug(f"Received binary data from {addr}, length: {len(data)} bytes")
-
-                    if peer_id:
-                        # This might be an unexpected binary chunk or encrypted data
-                        # Let the file transfer handler deal with it
-                        self.file_transfer.handle_binary_data(data, addr, peer_id)
+                            logger.info(f"Received test message from unknown peer: {addr}")
                     else:
-                        logger.warning(f"Received binary data from unknown peer {addr}")
+                        logger.warning(f"Unknown message type: {message_type}")
+
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # Ignore non-JSON data (might be legacy or STUN packets)
+                    logger.debug(f"Received non-JSON data from {addr}")
 
             except socket.timeout:
-                continue  # Just continue the loop on timeout
+                continue
             except Exception as e:
                 logger.error(f"Error handling message: {e}")
                 import traceback
@@ -419,16 +396,18 @@ class P2PNode:
         """
         peer_id = message.get('node_id')
         peer_public_key_pem = message.get('public_key')
+        peer_quic_port = message.get('quic_port', addr[1] + 1000)  # Default offset
 
         if not peer_id or not peer_public_key_pem:
             logger.error("Invalid hello message")
             return
 
-        logger.info(f"Received hello from peer {peer_id} at {addr}")
+        logger.info(f"Received hello from peer {peer_id} at {addr} (QUIC: {peer_quic_port})")
 
         # Store peer information
         self.peers[peer_id] = {
             'addr': addr,
+            'quic_port': peer_quic_port,
             'public_key': self.crypto_manager.load_peer_public_key(peer_public_key_pem.encode()),
             'connected': True,
             'last_seen': time.time()
@@ -438,7 +417,8 @@ class P2PNode:
         hello_ack = {
             'type': 'hello_ack',
             'node_id': self.node_id,
-            'public_key': self.crypto_manager.get_public_key_pem().decode()
+            'public_key': self.crypto_manager.get_public_key_pem().decode(),
+            'quic_port': self.external_quic_port
         }
 
         hello_ack_json = json.dumps(hello_ack).encode()
@@ -457,18 +437,20 @@ class P2PNode:
         """
         peer_id = message.get('node_id')
         peer_public_key_pem = message.get('public_key')
+        peer_quic_port = message.get('quic_port', addr[1] + 1000)  # Default offset
 
         if not peer_id or not peer_public_key_pem:
             logger.error("Invalid hello_ack message")
             return
 
-        logger.info(f"Received hello_ack from peer {peer_id}")
+        logger.info(f"Received hello_ack from peer {peer_id} (QUIC: {peer_quic_port})")
 
         # Update peer information
         if peer_id in self.peers:
             self.peers[peer_id]['public_key'] = self.crypto_manager.load_peer_public_key(
                 peer_public_key_pem.encode()
             )
+            self.peers[peer_id]['quic_port'] = peer_quic_port
             self.peers[peer_id]['connected'] = True
             self.peers[peer_id]['last_seen'] = time.time()
 
