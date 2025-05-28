@@ -63,26 +63,72 @@ class P2PNode:
 
     def connect_to_peer(self, peer_id: str, peer_ip: str, peer_port: int) -> bool:
         """
-        Perform NAT hole punching and exchange hello to establish connection.
+        Connect to a peer using their external IP and port.
+
+        Args:
+            peer_id: Unique identifier for the peer
+            peer_ip: External IP of the peer
+            peer_port: External port of the peer
+
+        Returns:
+            True if connection was successful, False otherwise
         """
         logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_port}")
+
+        # Perform UDP hole punching
         if not self.stun_client.punch_hole(peer_ip, peer_port):
             logger.error(f"Failed to punch hole to {peer_ip}:{peer_port}")
             return False
 
+        # Store peer information
         self.peers[peer_id] = {
             'addr': (peer_ip, peer_port),
             'public_key': None,
             'connected': False,
             'last_seen': time.time()
         }
-        hello = {
+
+        # Send hello message with our public key
+        hello_msg = {
             'type': 'hello',
             'node_id': self.node_id,
             'public_key': self.crypto_manager.get_public_key_pem().decode()
         }
-        self.socket.sendto(json.dumps(hello).encode(), (peer_ip, peer_port))
-        # spawn retry thread (omitted for brevity)
+
+        hello_json = json.dumps(hello_msg).encode()
+        self.socket.sendto(hello_json, (peer_ip, peer_port))
+
+        # Wait for response
+        logger.info(f"Waiting for response from peer {peer_id}")
+
+        def keep_trying():
+            attempts = 0
+            while attempts < 10 and peer_id in self.peers and not self.peers[peer_id].get('connected'):
+                time.sleep(2)
+                if peer_id in self.peers and not self.peers[peer_id].get('connected'):
+                    # Resend hello message
+                    hello_msg = {
+                        'type': 'hello',
+                        'node_id': self.node_id,
+                        'public_key': self.crypto_manager.get_public_key_pem().decode()
+                    }
+                    hello_json = json.dumps(hello_msg).encode()
+                    self.socket.sendto(hello_json, (peer_ip, peer_port))
+                    logger.info(f"Resending hello to peer {peer_id} (attempt {attempts + 2}/10)")
+                attempts += 1
+
+            if peer_id in self.peers and self.peers[peer_id].get('connected'):
+                logger.info(f"Successfully connected to peer {peer_id}")
+            else:
+                logger.warning(f"Failed to connect to peer {peer_id} after 10 attempts")
+
+        retry_thread = threading.Thread(target=keep_trying)
+        retry_thread.daemon = True
+        retry_thread.start()
+
+        # We'll wait for the response in the message handling thread
+        # The connection will be marked as successful when we receive a hello_ack
+
         return True
 
     def send_message(self, peer_id: str, message: str) -> bool:
