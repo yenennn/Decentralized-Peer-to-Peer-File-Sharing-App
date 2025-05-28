@@ -1,9 +1,7 @@
 """
-Enhanced reliable UDP file transfer with custom reliable UDP implementation.
-Uses a proven reliable protocol over your existing UDP socket infrastructure.
+Enhanced reliable UDP file transfer using the srudp library.
+Simple and reliable file transfer with proper library usage.
 """
-
-from __future__ import annotations
 
 import json
 import logging
@@ -12,12 +10,18 @@ import os
 import threading
 import time
 import uuid
-import struct
-import hashlib
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, Set, List
-from collections import defaultdict, deque
+from typing import Any, Callable, Dict, Optional, Tuple
 import socket
+
+try:
+    from srudp import SecureReliableSocket
+except ImportError:
+    print("Installing srudp library...")
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "srudp"])
+    from srudp import SecureReliableSocket
 
 logger = logging.getLogger(__name__)
 
@@ -25,228 +29,47 @@ logger = logging.getLogger(__name__)
 FILE_INIT = "file_init"
 FILE_INIT_ACK = "file_init_ack"
 FILE_CHUNK = "file_chunk"
-CHUNK_ACK = "chunk_ack"
 FILE_END = "file_end"
 FILE_END_ACK = "file_end_ack"
-RELIABLE_DATA = "reliable_data"
-RELIABLE_ACK = "reliable_ack"
-
-
-class ReliableUDPManager:
-    """
-    Simplified reliable UDP implementation with automatic retransmission and ordering.
-    Much simpler than the original sliding window but still reliable.
-    """
-
-    def __init__(self, socket_obj, timeout: float = 2.0, max_retries: int = 5):
-        self.socket = socket_obj
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.sequence_number = 0
-        self.expected_seq = {}  # peer_addr -> expected sequence number
-        self.pending_acks = {}  # (peer_addr, seq) -> (data, timestamp, retries)
-        self.received_messages = {}  # peer_addr -> {seq: data}
-        self.lock = threading.Lock()
-        self.running = True
-
-        # Start ACK management thread
-        self.ack_thread = threading.Thread(target=self._manage_acks, daemon=True)
-        self.ack_thread.start()
-
-    def send_reliable(self, data: bytes, peer_addr: Tuple[str, int]) -> bool:
-        """Send data reliably with automatic retransmission"""
-        with self.lock:
-            seq = self.sequence_number
-            self.sequence_number += 1
-
-        # Create reliable message
-        message = {
-            "type": RELIABLE_DATA,
-            "seq": seq,
-            "data": data.hex(),  # Convert to hex for JSON safety
-            "checksum": hashlib.md5(data).hexdigest()
-        }
-
-        message_data = json.dumps(message).encode()
-
-        with self.lock:
-            self.pending_acks[(peer_addr, seq)] = {
-                "data": message_data,
-                "timestamp": time.time(),
-                "retries": 0
-            }
-
-        try:
-            self.socket.sendto(message_data, peer_addr)
-            logger.debug(f"Sent reliable message seq={seq} to {peer_addr}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to send reliable message: {e}")
-            with self.lock:
-                if (peer_addr, seq) in self.pending_acks:
-                    del self.pending_acks[(peer_addr, seq)]
-            return False
-
-    def handle_reliable_message(self, data: bytes, peer_addr: Tuple[str, int]) -> Optional[bytes]:
-        """Handle incoming reliable messages and return payload if complete"""
-        try:
-            message = json.loads(data.decode())
-        except Exception:
-            return None
-
-        msg_type = message.get("type")
-
-        if msg_type == RELIABLE_DATA:
-            seq = message.get("seq")
-            payload_hex = message.get("data")
-            checksum = message.get("checksum")
-
-            if seq is None or payload_hex is None or checksum is None:
-                return None
-
-            # Convert hex back to bytes
-            try:
-                payload = bytes.fromhex(payload_hex)
-            except ValueError:
-                return None
-
-            # Verify checksum
-            if hashlib.md5(payload).hexdigest() != checksum:
-                logger.warning(f"Checksum mismatch for seq={seq} from {peer_addr}")
-                return None
-
-            # Send ACK
-            ack_message = {
-                "type": RELIABLE_ACK,
-                "seq": seq
-            }
-            try:
-                self.socket.sendto(json.dumps(ack_message).encode(), peer_addr)
-            except Exception as e:
-                logger.error(f"Failed to send ACK: {e}")
-
-            # Check if this is the expected sequence number
-            with self.lock:
-                expected = self.expected_seq.get(peer_addr, 0)
-
-                if seq == expected:
-                    # This is the next expected message
-                    self.expected_seq[peer_addr] = expected + 1
-
-                    # Store and check for any buffered messages we can now deliver
-                    if peer_addr not in self.received_messages:
-                        self.received_messages[peer_addr] = {}
-
-                    result_payload = payload
-
-                    # Check if we have subsequent messages buffered
-                    next_seq = expected + 1
-                    while next_seq in self.received_messages[peer_addr]:
-                        del self.received_messages[peer_addr][next_seq]
-                        next_seq += 1
-                        self.expected_seq[peer_addr] = next_seq
-
-                    return result_payload
-
-                elif seq > expected:
-                    # Future message - buffer it
-                    if peer_addr not in self.received_messages:
-                        self.received_messages[peer_addr] = {}
-                    self.received_messages[peer_addr][seq] = payload
-                    return None
-                else:
-                    # Old message - just ACK it but don't return data
-                    return None
-
-        elif msg_type == RELIABLE_ACK:
-            seq = message.get("seq")
-            if seq is not None:
-                with self.lock:
-                    if (peer_addr, seq) in self.pending_acks:
-                        del self.pending_acks[(peer_addr, seq)]
-                        logger.debug(f"Received ACK for seq={seq} from {peer_addr}")
-
-        return None
-
-    def _manage_acks(self):
-        """Manage ACKs and retransmissions"""
-        while self.running:
-            current_time = time.time()
-            to_retransmit = []
-            to_remove = []
-
-            with self.lock:
-                for (peer_addr, seq), info in self.pending_acks.items():
-                    if current_time - info["timestamp"] > self.timeout:
-                        if info["retries"] < self.max_retries:
-                            to_retransmit.append((peer_addr, seq, info))
-                        else:
-                            to_remove.append((peer_addr, seq))
-                            logger.warning(f"Message seq={seq} to {peer_addr} failed after {self.max_retries} retries")
-
-            # Retransmit messages
-            for peer_addr, seq, info in to_retransmit:
-                try:
-                    self.socket.sendto(info["data"], peer_addr)
-                    with self.lock:
-                        if (peer_addr, seq) in self.pending_acks:
-                            self.pending_acks[(peer_addr, seq)]["timestamp"] = current_time
-                            self.pending_acks[(peer_addr, seq)]["retries"] += 1
-                    logger.debug(f"Retransmitted seq={seq} to {peer_addr} (retry {info['retries'] + 1})")
-                except Exception as e:
-                    logger.error(f"Failed to retransmit to {peer_addr}: {e}")
-
-            # Remove failed messages
-            with self.lock:
-                for key in to_remove:
-                    if key in self.pending_acks:
-                        del self.pending_acks[key]
-
-            time.sleep(0.1)  # Check every 100ms
-
-    def stop(self):
-        """Stop the reliable UDP manager"""
-        self.running = False
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get statistics about pending ACKs"""
-        with self.lock:
-            return {
-                "pending_acks": len(self.pending_acks),
-                "sequence_number": self.sequence_number,
-                "peers_tracked": len(self.expected_seq)
-            }
 
 
 class FileTransfer:
-    """Enhanced reliable file transfer using simplified reliable UDP"""
+    """Simple and reliable file transfer using srudp library"""
 
     # Configuration
-    DEFAULT_CHUNK_SIZE = 32 * 1024  # 32 KiB
-    RELIABLE_TIMEOUT = 2.0  # 2 seconds for reliable UDP
-    MAX_RETRIES = 5
-    PROGRESS_UPDATE_INTERVAL = 1.0
+    DEFAULT_CHUNK_SIZE = 64 * 1024  # 64 KiB - larger chunks since reliability is handled by srudp
+    CONNECTION_TIMEOUT = 30.0
+    TRANSFER_TIMEOUT = 300.0  # 5 minutes
 
     def __init__(self, sock, crypto_manager):
-        self.socket = sock
+        self.base_socket = sock  # Original UDP socket (for compatibility)
         self.crypto = crypto_manager
         self.lock = threading.Lock()
         self.transfers: Dict[str, Dict[str, Any]] = {}
         self.save_dir: Path = Path.cwd()
         self.progress_callback: Optional[Callable[[str, int, int], None]] = None
-
-        # Initialize reliable UDP manager
-        self.reliable_udp = ReliableUDPManager(sock, self.RELIABLE_TIMEOUT, self.MAX_RETRIES)
-
-        # Message queues for different peers
-        self.message_queues: Dict[str, deque] = defaultdict(deque)
-        self.queue_lock = threading.Lock()
+        self.reliable_connections: Dict[str, SecureReliableSocket] = {}  # peer_id -> srudp socket
 
     def receive_file(self, save_dir: str, progress_callback: Callable[[str, int, int], None]):
         """Configure where incoming files are stored and how to report progress."""
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.progress_callback = progress_callback
+
+    def get_reliable_connection(self, peer_addr: Tuple[str, int]) -> SecureReliableSocket:
+        """Get or create a reliable connection to peer"""
+        peer_key = f"{peer_addr[0]}:{peer_addr[1]}"
+
+        with self.lock:
+            if peer_key in self.reliable_connections:
+                return self.reliable_connections[peer_key]
+
+            # Create new reliable socket
+            reliable_sock = SecureReliableSocket()
+            reliable_sock.settimeout(self.CONNECTION_TIMEOUT)
+
+            self.reliable_connections[peer_key] = reliable_sock
+            return reliable_sock
 
     def send_file(self, file_path: str, peer_id: str, peer_addr: Tuple[str, int],
                   progress_callback: Callable[[str, int, int], None]) -> str:
@@ -276,22 +99,33 @@ class FileTransfer:
 
         # Start upload worker thread
         upload_thread = threading.Thread(
-            target=self._reliable_upload_worker,
+            target=self._upload_worker,
             args=(transfer_id,),
             daemon=True
         )
         upload_thread.start()
         return transfer_id
 
-    def _reliable_upload_worker(self, transfer_id: str):
-        """Upload worker using reliable UDP"""
+    def _upload_worker(self, transfer_id: str):
+        """Upload worker using srudp for reliable transmission"""
         with self.lock:
             tf = self.transfers[transfer_id]
 
         peer_addr = tf["peer_addr"]
         peer_id = tf["peer_id"]
+        reliable_sock = None
 
         try:
+            # Create reliable connection
+            reliable_sock = self.get_reliable_connection(peer_addr)
+
+            logger.info(f"Connecting to {peer_addr} for file transfer...")
+            reliable_sock.connect(peer_addr)
+            logger.info(f"Connected to {peer_addr}")
+
+            with self.lock:
+                tf["status"] = "uploading"
+
             # Send file initialization
             init_msg = {
                 "type": FILE_INIT,
@@ -303,42 +137,29 @@ class FileTransfer:
             }
 
             init_data = json.dumps(init_msg).encode()
-            if not self.reliable_udp.send_reliable(init_data, peer_addr):
-                raise Exception("Failed to send file initialization")
+            reliable_sock.send(init_data)
+            logger.info(f"Sent file init for {tf['file_name']}")
 
-            # Wait for acknowledgment with timeout
-            ack_received = False
-            timeout_start = time.time()
-            while time.time() - timeout_start < 10.0:  # 10 second timeout
-                with self.queue_lock:
-                    if peer_id in self.message_queues and self.message_queues[peer_id]:
-                        msg_data = self.message_queues[peer_id].popleft()
-                        try:
-                            msg = json.loads(msg_data.decode())
-                            if (msg.get("type") == FILE_INIT_ACK and
-                                msg.get("transfer_id") == transfer_id):
-                                ack_received = True
-                                break
-                        except:
-                            pass
-                time.sleep(0.1)
+            # Wait for acknowledgment
+            ack_data = reliable_sock.recv(1024)
+            ack_msg = json.loads(ack_data.decode())
 
-            if not ack_received:
-                raise Exception("No acknowledgment received for file init")
+            if ack_msg.get("type") != FILE_INIT_ACK:
+                raise Exception("Invalid acknowledgment received")
 
-            with self.lock:
-                tf["status"] = "uploading"
+            logger.info("Received file init acknowledgment")
 
             # Send file chunks
             last_progress_update = time.time()
 
             with open(tf["file_path"], "rb") as file_handle:
                 for chunk_index in range(tf["total_chunks"]):
-                    # Read and encrypt chunk
+                    # Read chunk
                     chunk_data = file_handle.read(self.DEFAULT_CHUNK_SIZE)
                     if not chunk_data:
                         break
 
+                    # Encrypt chunk
                     encrypted_data = self._encrypt(peer_id, chunk_data)
 
                     # Create chunk message
@@ -346,24 +167,28 @@ class FileTransfer:
                         "type": FILE_CHUNK,
                         "transfer_id": transfer_id,
                         "chunk_index": chunk_index,
-                        "chunk_data": encrypted_data.hex(),  # Convert to hex for JSON
+                        "chunk_size": len(encrypted_data),
                         "total_chunks": tf["total_chunks"],
                     }
 
-                    chunk_msg_data = json.dumps(chunk_msg).encode()
+                    # Send chunk header
+                    chunk_header = json.dumps(chunk_msg).encode()
+                    reliable_sock.send(chunk_header)
 
-                    if not self.reliable_udp.send_reliable(chunk_msg_data, peer_addr):
-                        raise Exception(f"Failed to send chunk {chunk_index}")
+                    # Send chunk data
+                    reliable_sock.send(encrypted_data)
 
                     with self.lock:
                         tf["chunks_sent"] = chunk_index + 1
 
                     # Update progress
                     now = time.time()
-                    if now - last_progress_update > self.PROGRESS_UPDATE_INTERVAL:
+                    if now - last_progress_update > 1.0:
                         if tf["progress_cb"]:
                             tf["progress_cb"](transfer_id, chunk_index + 1, tf["total_chunks"])
                         last_progress_update = now
+
+                    logger.debug(f"Sent chunk {chunk_index + 1}/{tf['total_chunks']}")
 
                     # Check for cancellation
                     with self.lock:
@@ -376,65 +201,53 @@ class FileTransfer:
                 "transfer_id": transfer_id,
             }
             end_data = json.dumps(end_msg).encode()
-            if not self.reliable_udp.send_reliable(end_data, peer_addr):
-                raise Exception("Failed to send completion message")
+            reliable_sock.send(end_data)
 
-            with self.lock:
-                tf["status"] = "completed"
-                tf["end_time"] = time.time()
-                duration = tf["end_time"] - tf["start_time"]
-                speed = tf["file_size"] / duration / 1024 if duration > 0 else 0
-                logger.info(f"Upload of {tf['file_name']} completed - {speed:.2f} KB/s")
+            # Wait for final acknowledgment
+            final_ack_data = reliable_sock.recv(1024)
+            final_ack_msg = json.loads(final_ack_data.decode())
+
+            if final_ack_msg.get("type") == FILE_END_ACK:
+                with self.lock:
+                    tf["status"] = "completed"
+                    tf["end_time"] = time.time()
+                    duration = tf["end_time"] - tf["start_time"]
+                    speed = tf["file_size"] / duration / 1024 if duration > 0 else 0
+                    logger.info(f"Upload of {tf['file_name']} completed - {speed:.2f} KB/s")
+            else:
+                raise Exception("Invalid final acknowledgment")
 
         except Exception as e:
             logger.error(f"Upload failed for transfer {transfer_id}: {e}")
             with self.lock:
                 tf["status"] = "failed"
                 tf["error"] = str(e)
+        finally:
+            if reliable_sock:
+                try:
+                    reliable_sock.close()
+                except:
+                    pass
 
     def handle_message(self, data: bytes, addr: Tuple[str, int], peer_id: str):
-        """Handle incoming messages through reliable UDP"""
-        # First try to handle as reliable UDP message
-        payload = self.reliable_udp.handle_reliable_message(data, addr)
+        """Handle incoming messages - mainly for file init over regular UDP"""
+        try:
+            msg = json.loads(data.decode())
+        except Exception:
+            logger.debug("handle_message: not JSON – ignoring")
+            return
 
-        if payload:
-            # Queue the payload for the peer
-            with self.queue_lock:
-                self.message_queues[peer_id].append(payload)
-
-            # Try to process as file transfer message
-            try:
-                msg = json.loads(payload.decode())
-                mtype = msg.get("type")
-
-                if mtype == FILE_INIT:
-                    self._handle_file_init(msg, addr, peer_id)
-                elif mtype == FILE_CHUNK:
-                    self._handle_file_chunk(msg, addr, peer_id)
-                elif mtype == FILE_END:
-                    self._handle_file_end(msg, addr, peer_id)
-
-            except Exception as e:
-                logger.debug(f"Could not process as file transfer message: {e}")
-        else:
-            # Try to handle as regular JSON message (non-reliable)
-            try:
-                msg = json.loads(data.decode())
-                mtype = msg.get("type")
-
-                if mtype == FILE_INIT:
-                    self._handle_file_init(msg, addr, peer_id)
-
-            except Exception:
-                logger.debug("Could not process message")
+        mtype = msg.get("type")
+        if mtype == FILE_INIT:
+            self._handle_file_init(msg, addr, peer_id)
 
     def _handle_file_init(self, msg: Dict[str, Any], addr: Tuple[str, int], peer_id: str):
-        """Handle file initialization"""
+        """Handle file initialization and start reliable download"""
         transfer_id = msg["transfer_id"]
 
         with self.lock:
             if transfer_id in self.transfers:
-                return  # Already handling this transfer
+                return  # Already handling
 
             self.transfers[transfer_id] = {
                 "direction": "in",
@@ -443,7 +256,6 @@ class FileTransfer:
                 "chunk_size": msg["chunk_size"],
                 "total_chunks": msg["total_chunks"],
                 "chunks_received": 0,
-                "received_chunks": {},  # chunk_index -> data
                 "status": "receiving",
                 "peer_addr": addr,
                 "peer_id": peer_id,
@@ -452,108 +264,105 @@ class FileTransfer:
 
         logger.info(f"Incoming file {msg['file_name']} ({msg['file_size']} bytes) from {peer_id}")
 
-        # Send acknowledgment
-        ack_msg = {"type": FILE_INIT_ACK, "transfer_id": transfer_id}
-        ack_data = json.dumps(ack_msg).encode()
-        self.reliable_udp.send_reliable(ack_data, addr)
-
         # Start download worker
         download_thread = threading.Thread(
-            target=self._reliable_download_worker,
+            target=self._download_worker,
             args=(transfer_id,),
             daemon=True
         )
         download_thread.start()
 
-    def _handle_file_chunk(self, msg: Dict[str, Any], addr: Tuple[str, int], peer_id: str):
-        """Handle file chunk"""
-        transfer_id = msg["transfer_id"]
-        chunk_index = msg["chunk_index"]
-        chunk_data_hex = msg["chunk_data"]
-
-        with self.lock:
-            tf = self.transfers.get(transfer_id)
-            if not tf or tf["direction"] != "in":
-                return
-
-            # Convert hex back to bytes and decrypt
-            try:
-                encrypted_data = bytes.fromhex(chunk_data_hex)
-                chunk_data = self._decrypt(peer_id, encrypted_data)
-                tf["received_chunks"][chunk_index] = chunk_data
-                logger.debug(f"Received chunk {chunk_index + 1}/{tf['total_chunks']} for {transfer_id}")
-            except Exception as e:
-                logger.error(f"Failed to process chunk {chunk_index}: {e}")
-
-    def _handle_file_end(self, msg: Dict[str, Any], addr: Tuple[str, int], peer_id: str):
-        """Handle file end"""
-        transfer_id = msg["transfer_id"]
-
-        with self.lock:
-            tf = self.transfers.get(transfer_id)
-            if tf and tf["direction"] == "in":
-                tf["end_received"] = True
-
-    def _reliable_download_worker(self, transfer_id: str):
-        """Download worker that processes queued messages"""
+    def _download_worker(self, transfer_id: str):
+        """Download worker using srudp for reliable reception"""
         with self.lock:
             tf = self.transfers[transfer_id]
 
+        peer_addr = tf["peer_addr"]
         peer_id = tf["peer_id"]
-        last_progress_update = time.time()
+        reliable_sock = None
 
         try:
-            # Open file for writing
+            # Create reliable socket for listening
+            reliable_sock = SecureReliableSocket()
+            reliable_sock.settimeout(self.CONNECTION_TIMEOUT)
+
+            # Bind to a local port for the peer to connect to
+            local_port = self.base_socket.getsockname()[1] + 1  # Use next port
+            reliable_sock.bind(('0.0.0.0', local_port))
+            reliable_sock.listen(1)
+
+            logger.info(f"Listening for reliable connection on port {local_port}")
+
+            # Send acknowledgment with our listening port
+            ack_msg = {
+                "type": FILE_INIT_ACK,
+                "transfer_id": transfer_id,
+                "reliable_port": local_port
+            }
+            ack_data = json.dumps(ack_msg).encode()
+            self.base_socket.sendto(ack_data, peer_addr)
+
+            # Accept reliable connection
+            conn, addr = reliable_sock.accept()
+            logger.info(f"Accepted reliable connection from {addr}")
+
+            # Prepare file for writing
             dest_path = self.save_dir / tf["file_name"]
 
-            # Wait for all chunks or end signal
-            while True:
-                with self.lock:
-                    # Check if we have all chunks
-                    if len(tf["received_chunks"]) >= tf["total_chunks"]:
-                        break
-
-                    # Check if end was received
-                    if tf.get("end_received"):
-                        break
-
-                    # Check for timeout or failure
-                    if time.time() - tf["start_time"] > 300:  # 5 minute timeout
-                        raise Exception("Transfer timeout")
-
-                # Process any queued messages for this peer
-                with self.queue_lock:
-                    if peer_id in self.message_queues:
-                        while self.message_queues[peer_id]:
-                            msg_data = self.message_queues[peer_id].popleft()
-                            try:
-                                msg = json.loads(msg_data.decode())
-                                if msg.get("transfer_id") == transfer_id:
-                                    if msg.get("type") == FILE_CHUNK:
-                                        self._handle_file_chunk(msg, tf["peer_addr"], peer_id)
-                                    elif msg.get("type") == FILE_END:
-                                        self._handle_file_end(msg, tf["peer_addr"], peer_id)
-                            except:
-                                pass
-
-                # Update progress
-                now = time.time()
-                if now - last_progress_update > self.PROGRESS_UPDATE_INTERVAL:
-                    with self.lock:
-                        if self.progress_callback:
-                            self.progress_callback(transfer_id, len(tf["received_chunks"]), tf["total_chunks"])
-                    last_progress_update = now
-
-                time.sleep(0.1)
-
-            # Write file in order
             with open(dest_path, "wb") as file_handle:
-                with self.lock:
-                    for i in range(tf["total_chunks"]):
-                        if i in tf["received_chunks"]:
-                            file_handle.write(tf["received_chunks"][i])
-                        else:
-                            raise Exception(f"Missing chunk {i}")
+                chunks_received = 0
+                last_progress_update = time.time()
+
+                while chunks_received < tf["total_chunks"]:
+                    # Receive chunk header
+                    header_data = conn.recv(4096)
+                    if not header_data:
+                        break
+
+                    try:
+                        chunk_msg = json.loads(header_data.decode())
+                    except:
+                        break
+
+                    if chunk_msg.get("type") == FILE_CHUNK:
+                        chunk_size = chunk_msg["chunk_size"]
+                        chunk_index = chunk_msg["chunk_index"]
+
+                        # Receive chunk data
+                        chunk_data = conn.recv(chunk_size)
+                        if len(chunk_data) != chunk_size:
+                            raise Exception(f"Incomplete chunk data received")
+
+                        # Decrypt and write chunk
+                        try:
+                            plaintext = self._decrypt(peer_id, chunk_data)
+                            file_handle.write(plaintext)
+                            file_handle.flush()
+                        except Exception as e:
+                            raise Exception(f"Decryption failed: {e}")
+
+                        chunks_received += 1
+
+                        with self.lock:
+                            tf["chunks_received"] = chunks_received
+
+                        # Update progress
+                        now = time.time()
+                        if now - last_progress_update > 1.0:
+                            if self.progress_callback:
+                                self.progress_callback(transfer_id, chunks_received, tf["total_chunks"])
+                            last_progress_update = now
+
+                        logger.debug(f"Received chunk {chunk_index + 1}/{tf['total_chunks']}")
+
+                    elif chunk_msg.get("type") == FILE_END:
+                        # Transfer completed
+                        break
+
+            # Send final acknowledgment
+            final_ack = {"type": FILE_END_ACK, "transfer_id": transfer_id}
+            final_data = json.dumps(final_ack).encode()
+            conn.send(final_data)
 
             with self.lock:
                 tf["status"] = "completed"
@@ -567,11 +376,22 @@ class FileTransfer:
             with self.lock:
                 tf["status"] = "failed"
                 tf["error"] = str(e)
+        finally:
+            if reliable_sock:
+                try:
+                    reliable_sock.close()
+                except:
+                    pass
 
     def stop(self):
         """Stop the file transfer manager"""
-        if hasattr(self, 'reliable_udp'):
-            self.reliable_udp.stop()
+        with self.lock:
+            for sock in self.reliable_connections.values():
+                try:
+                    sock.close()
+                except:
+                    pass
+            self.reliable_connections.clear()
 
     def cancel_transfer(self, transfer_id: str) -> bool:
         """Cancel an ongoing transfer"""
@@ -584,32 +404,6 @@ class FileTransfer:
                     return True
         return False
 
-    # Utility methods
-    def _encrypt(self, peer_id: str, plaintext: bytes) -> bytes:
-        """Encrypt data using crypto manager"""
-        if hasattr(self.crypto, "encrypt_data"):
-            return self.crypto.encrypt_data(peer_id, plaintext)
-        return plaintext
-
-    def _decrypt(self, peer_id: str, ciphertext: bytes) -> bytes:
-        """Decrypt data using crypto manager"""
-        if hasattr(self.crypto, "decrypt_data"):
-            return self.crypto.decrypt_data(peer_id, ciphertext)
-        return ciphertext
-
-    # Legacy compatibility methods
-    def handle_binary_data(self, *args):
-        """Legacy method for binary data handling"""
-        pass
-
-    def _handle_file_chunk(self, *args):
-        """Legacy method - now handled by new system"""
-        pass
-
-    def _process_chunk(self, *args):
-        """Legacy method - now handled by new system"""
-        pass
-
     def get_transfer_status(self, transfer_id: str) -> Dict:
         """Get transfer status - compatible with existing API"""
         with self.lock:
@@ -621,7 +415,7 @@ class FileTransfer:
             if tf["direction"] == "out":
                 completed = tf["chunks_sent"]
             else:
-                completed = len(tf.get("received_chunks", {}))
+                completed = tf["chunks_received"]
 
             total = tf["total_chunks"]
             progress = (completed / total * 100) if total > 0 else 0
@@ -638,4 +432,33 @@ class FileTransfer:
                 duration = tf['end_time'] - tf['start_time']
                 result['speed'] = tf['file_size'] / duration / 1024 if duration > 0 else 0
 
+            if 'error' in tf:
+                result['error'] = tf['error']
+
             return result
+
+    # Utility methods
+    def _encrypt(self, peer_id: str, plaintext: bytes) -> bytes:
+        """Encrypt data using crypto manager"""
+        if hasattr(self.crypto, "encrypt_data"):
+            return self.crypto.encrypt_data(peer_id, plaintext)
+        return plaintext
+
+    def _decrypt(self, peer_id: str, ciphertext: bytes) -> bytes:
+        """Decrypt data using crypto manager"""
+        if hasattr(self.crypto, "decrypt_data"):
+            return self.crypto.decrypt_data(peer_id, ciphertext)
+        return ciphertext
+
+    # Legacy compatibility methods for existing P2P node
+    def handle_binary_data(self, *args):
+        """Legacy method - not needed with reliable sockets"""
+        pass
+
+    def _handle_file_chunk(self, *args):
+        """Legacy method - handled by reliable connection"""
+        pass
+
+    def _process_chunk(self, *args):
+        """Legacy method - handled by reliable connection"""
+        pass
