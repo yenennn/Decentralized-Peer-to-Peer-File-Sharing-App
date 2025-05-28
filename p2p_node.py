@@ -239,43 +239,56 @@ class P2PNode:
         except queue.Empty:
             return None
 
-    def get_transfer_status(self, transfer_id: str) -> Dict[str, Any]:
-        """Return progress and status for an ongoing or completed transfer."""
-        # ——— Sender side ———
-        sess = self.file_transfer._send_sessions.get(transfer_id)
-        if sess:
-            total = sess['file_size']
-            # you can track bytes_sent inside your progress callback and stash on sess['_bytes_sent']
-            sent = sess.get('_bytes_sent', 0)
-            pct  = (sent / total * 100) if total else 0
-            status = 'completed' if sess['end_acked'] else 'in_progress'
-            return {
-                'transfer_id': transfer_id,
-                'file_name': os.path.basename(sess['file_path']),
-                'file_size': total,
-                'progress': pct,
-                'status': status
-            }
+    def get_transfer_status(self, transfer_id: str) -> Dict:
+        """
+        Get the status of a file transfer.
 
-        # ——— Receiver side ———
-        sess = self.file_transfer._recv_sessions.get(transfer_id)
-        if sess:
-            total    = sess['file_size']
-            received = sess.get('received', 0)
-            pct      = (received / total * 100) if total else 0
-            status   = 'completed' if received >= total else 'in_progress'
-            return {
-                'transfer_id': transfer_id,
-                'file_name': os.path.basename(sess['file_handle'].name),
-                'file_size': total,
-                'progress': pct,
-                'status': status
-            }
+        Args:
+            transfer_id: Unique transfer ID
 
-        return {'status': 'unknown'}
+        Returns:
+            Transfer status information
+        """
+        if transfer_id not in self.file_transfer.transfers:
+            return {'status': 'unknown'}
 
-    def get_peer_info(self) -> Dict[str, Any]:
-        """Return this node’s ID and external connection info for sharing with peers."""
+        transfer = self.file_transfer.transfers[transfer_id]
+
+        # Calculate progress percentage
+        if transfer['total_chunks'] > 0:
+            if 'chunks_sent' in transfer:
+                progress = (transfer['chunks_sent'] / transfer['total_chunks']) * 100
+            else:
+                progress = (transfer['chunks_received'] / transfer['total_chunks']) * 100
+        else:
+            progress = 0
+
+        # Calculate transfer speed
+        if transfer['status'] == 'completed' and 'end_time' in transfer and 'start_time' in transfer:
+            duration = transfer['end_time'] - transfer['start_time']
+            if duration > 0:
+                speed = transfer['file_size'] / duration / 1024  # KB/s
+            else:
+                speed = 0
+        else:
+            speed = 0
+
+        return {
+            'transfer_id': transfer_id,
+            'file_name': transfer['file_name'],
+            'file_size': transfer['file_size'],
+            'status': transfer['status'],
+            'progress': progress,
+            'speed': speed
+        }
+
+    def get_peer_info(self) -> Dict:
+        """
+        Get information about this node for sharing with peers.
+
+        Returns:
+            Dictionary with node information
+        """
         return {
             'node_id': self.node_id,
             'external_ip': self.external_ip,
@@ -284,52 +297,117 @@ class P2PNode:
         }
 
     def _handle_messages(self) -> None:
-        """
-        Unified dispatcher:
-         - JSON control messages:
-             • hello / hello_ack → self._handle_hello[_ack]
-             • key_exchange / key_exchange_ack → self._handle_key_exchange[_ack]
-             • test_message → enqueue in self.incoming_messages
-             • file‐init / file_end / their ACKs → self.file_transfer.handle_message
-         - all other (binary) → self.file_transfer.handle_binary_data
-        """
+        """Handle incoming messages in a loop"""
         while self.running:
             try:
-                data, addr = self.socket.recvfrom(64 * 1024)
-                # find peer_id
-                peer_id = next((pid for pid,p in self.peers.items() if p['addr']==addr), None)
-                if not peer_id:
-                    continue
+                data, addr = self.socket.recvfrom(65536)  # Max UDP packet size
 
-                # try JSON parse
-                try:
-                    msg = json.loads(data.decode())
-                    t = msg.get('type')
-                    if t == 'hello':
-                        self._handle_hello(msg, addr)
-                    elif t == 'hello_ack':
-                        self._handle_hello_ack(msg, addr)
-                    elif t == 'key_exchange':
-                        self._handle_key_exchange(msg, addr)
-                    elif t == 'key_exchange_ack':
-                        self._handle_key_exchange_ack(msg, addr)
-                    elif t == 'test_message':
-                        self.incoming_messages.put({
-                            'peer_id': msg.get('from'),
-                            'message': msg.get('message','')
-                        })
+                # First identify the peer based on address
+                peer_id = None
+                for pid, peer in self.peers.items():
+                    if peer['addr'] == addr:
+                        peer_id = pid
+                        break
+
+                # If we're expecting binary data, process it directly
+                if self.expecting_binary:
+                    # Reset the flag immediately
+                    self.expecting_binary = False
+
+                    if peer_id and self.expected_transfer_id is not None and self.expected_chunk_index is not None:
+                        logger.debug(
+                            f"Processing expected binary chunk data for transfer {self.expected_transfer_id}, chunk {self.expected_chunk_index}")
+
+                        # Process the binary data directly
+                        self.file_transfer._process_chunk(
+                            self.expected_transfer_id,
+                            self.expected_chunk_index,
+                            peer_id,
+                            addr,
+                            data
+                        )
+
+                        # Clear the expected values
+                        self.expected_transfer_id = None
+                        self.expected_chunk_index = None
+                        self.expected_chunk_size = 0
                     else:
-                        # any file‐transfer control
-                        self.file_transfer.handle_message(data, addr, peer_id)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    # not JSON → raw KCP packet
-                    self.file_transfer.handle_binary_data(data, addr, peer_id)
+                        logger.warning(f"Received binary data but missing context information")
+
+                    continue  # Skip further processing for expected binary data
+
+                # For all other data, first check if it looks like text/JSON
+                try:
+                    # Try to decode as UTF-8
+                    text_data = data.decode('utf-8')
+
+                    # Try to parse as JSON
+                    try:
+                        message = json.loads(text_data)
+                        message_type = message.get('type')
+
+                        # Handle known message types
+                        if message_type == 'hello':
+                            self._handle_hello(message, addr)
+                        elif message_type == 'hello_ack':
+                            self._handle_hello_ack(message, addr)
+                        elif message_type == 'key_exchange':
+                            self._handle_key_exchange(message, addr)
+                        elif message_type == 'key_exchange_ack':
+                            self._handle_key_exchange_ack(message, addr)
+                        elif message_type == 'file_chunk':
+                            # Set up to receive binary data next
+                            self.expecting_binary = True
+                            self.expected_chunk_size = message.get('chunk_size', 0)
+                            self.expected_transfer_id = message.get('transfer_id')
+                            self.expected_chunk_index = message.get('chunk_index')
+
+                            if peer_id:
+                                # Store the chunk header information
+                                self.file_transfer._handle_file_chunk(message, addr, peer_id)
+                                logger.debug(
+                                    f"Received header for chunk {self.expected_chunk_index} of transfer {self.expected_transfer_id}")
+                            else:
+                                logger.warning(f"Received file chunk from unknown peer {addr}")
+                        elif message_type == 'test_message':
+                            # Handle test message
+                            peer_id_from = message.get('from', None)
+                            msg_text = message.get('message', '')
+                            if peer_id_from:
+                                self.incoming_messages.put({'peer_id': peer_id_from, 'message': msg_text})
+                            else:
+                                logger.info(f"Received test message from unknown peer: {addr}")
+                        elif peer_id:
+                            # Handle other file transfer related messages by passing raw data
+                            # This includes: file_init, file_init_ack, chunk_ack, window_ack, selective_nack, file_end, file_end_ack
+                            self.file_transfer.handle_message(data, addr, peer_id)
+                        else:
+                            logger.warning(f"Received message from unknown peer {addr}: {message_type}")
+
+                    except json.JSONDecodeError:
+                        # Valid UTF-8 but not JSON - might be a text protocol message
+                        logger.debug(f"Received non-JSON text from {addr}: {text_data[:100]}...")
+                        if peer_id:
+                            # Pass to file transfer handler as raw bytes
+                            self.file_transfer.handle_message(data, addr, peer_id)
+
+                except UnicodeDecodeError:
+                    # This is binary data that can't be decoded as UTF-8
+                    logger.debug(f"Received binary data from {addr}, length: {len(data)} bytes")
+
+                    if peer_id:
+                        # This might be an unexpected binary chunk or encrypted data
+                        # Let the file transfer handler deal with it
+                        self.file_transfer.handle_binary_data(data, addr, peer_id)
+                    else:
+                        logger.warning(f"Received binary data from unknown peer {addr}")
 
             except socket.timeout:
-                continue
+                continue  # Just continue the loop on timeout
             except Exception as e:
-                logger.error(f"Message loop error: {e}")
-                break
+                logger.error(f"Error handling message: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
 
     def _handle_hello(self, message: Dict, addr: Tuple[str, int]) -> None:
         """
