@@ -99,7 +99,8 @@ class FileTransfer:
         def _upload_output(_kcp, data: bytes):
             self.socket.sendto(data, peer_addr)
 
-        kcp = KCP(conv, _upload_output)
+        kcp = KCP(conv)
+        kcp.output = _upload_output
         sess['kcp'] = kcp
 
         # 5) Stream encrypted file data over KCP
@@ -175,7 +176,8 @@ class FileTransfer:
         def _recv_output(_kcp, data: bytes):
             self.socket.sendto(data, addr)
 
-        kcp = KCP(conv, _recv_output)
+        kcp = KCP(conv)
+        kcp.output = _recv_output
 
         # Store session
         self._recv_sessions[transfer_id] = {
