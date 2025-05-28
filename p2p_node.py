@@ -1,6 +1,6 @@
 """
-Main P2P node implementation.
-Handles peer connections, NAT traversal, and file transfers.
+Main P2P node implementation with TCP file transfer.
+Handles peer connections, NAT traversal, and TCP-based file transfers.
 """
 import os
 import socket
@@ -15,7 +15,7 @@ from typing import Dict, List, Tuple, Optional, Callable, Any
 
 from stun_client import STUNClient
 from crypto import CryptoManager
-from file_transfer import FileTransfer
+from tcp_file_transfer import TCPFileTransfer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 class P2PNode:
     """
-    P2P node for decentralized file sharing.
-    Handles NAT traversal, peer connections, and file transfers.
+    P2P node for decentralized file sharing with TCP-based file transfer.
+    Handles NAT traversal, peer connections, and reliable file transfers.
     """
 
     def __init__(self, local_port: int = 0, save_dir: str = "./downloads"):
@@ -32,18 +32,17 @@ class P2PNode:
         Initialize the P2P node.
 
         Args:
-            local_port: Local UDP port to bind to. If 0, a random port will be assigned.
+            local_port: Local UDP port to bind to for peer communication. If 0, a random port will be assigned.
             save_dir: Directory to save received files
         """
         self.node_id = str(uuid.uuid4())
         self.local_port = local_port
         self.save_dir = os.path.abspath(save_dir)
-        self.peers = {}  # {peer_id: {addr: (ip, port), public_key: key}}
+        self.peers = {}  # {peer_id: {addr: (ip, udp_port), tcp_port: port, public_key: key}}
         self.running = False
         self.stun_client = STUNClient(local_port)
         self.crypto_manager = CryptoManager()
         self.socket = None
-        self.file_transfer = None
         self.incoming_messages = queue.Queue()
 
         # Create save directory if it doesn't exist
@@ -54,33 +53,29 @@ class P2PNode:
         self.external_ip = None
         self.external_port = None
 
-        # Track expected binary data
-        self.expecting_binary = False
-        self.expected_chunk_size = 0
-        self.expected_transfer_id = None
-        self.expected_chunk_index = None
+        # TCP File Transfer - This replaces the UDP file transfer
+        self.tcp_file_transfer = TCPFileTransfer(self.crypto_manager, save_dir)
 
     def start(self) -> Tuple[str, int]:
         """
         Start the P2P node.
 
         Returns:
-            Tuple of (external_ip, external_port)
+            Tuple of (external_ip, external_udp_port)
         """
-        # Discover NAT type and external IP/port
+        # Discover NAT type and external IP/port using STUN
         self.nat_type, self.external_ip, self.external_port = self.stun_client.discover_nat()
 
         if not self.external_ip or not self.external_port:
             raise RuntimeError("Failed to discover external IP and port")
 
-        # Create UDP socket
+        # Create UDP socket for peer communication (not file transfer)
         self.socket = self.stun_client.create_socket()
 
-        # Initialize file transfer manager
-        self.file_transfer = FileTransfer(self.socket, self.crypto_manager)
-        self.file_transfer.receive_file(self.save_dir, self._on_transfer_progress)
+        # Set progress callback for TCP file transfers
+        self.tcp_file_transfer.set_progress_callback(self._on_transfer_progress)
 
-        # Start message handling thread
+        # Start message handling thread for peer communication
         self.running = True
         self.message_thread = threading.Thread(target=self._handle_messages)
         self.message_thread.daemon = True
@@ -89,59 +84,65 @@ class P2PNode:
         logger.info(f"P2P node started with ID: {self.node_id}")
         logger.info(f"NAT Type: {self.nat_type}")
         logger.info(f"External IP: {self.external_ip}")
-        logger.info(f"External Port: {self.external_port}")
-        logger.info(f"Local Port: {self.local_port}")
+        logger.info(f"External UDP Port: {self.external_port}")
+        logger.info(f"TCP File Transfer Port: {self.tcp_file_transfer.tcp_port}")
 
         return self.external_ip, self.external_port
 
     def stop(self) -> None:
-        """Stop the P2P node"""
+        """Stop the P2P node and all services"""
         self.running = False
         if self.socket:
             self.socket.close()
+
+        # Stop TCP file transfer service
+        self.tcp_file_transfer.stop()
+
         logger.info("P2P node stopped")
 
-    def connect_to_peer(self, peer_id: str, peer_ip: str, peer_port: int) -> bool:
+    def connect_to_peer(self, peer_id: str, peer_ip: str, peer_udp_port: int, peer_tcp_port: int = None) -> bool:
         """
-        Connect to a peer using their external IP and port.
+        Connect to a peer using their external IP and ports.
 
         Args:
             peer_id: Unique identifier for the peer
             peer_ip: External IP of the peer
-            peer_port: External port of the peer
+            peer_udp_port: External UDP port of the peer (for peer communication)
+            peer_tcp_port: TCP port of the peer (for file transfers) - can be None, will be exchanged
 
         Returns:
             True if connection was successful, False otherwise
         """
-        logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_port}")
+        logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_udp_port} (TCP: {peer_tcp_port})")
 
-        # Perform UDP hole punching
-        if not self.stun_client.punch_hole(peer_ip, peer_port):
-            logger.error(f"Failed to punch hole to {peer_ip}:{peer_port}")
+        # Perform UDP hole punching for peer communication
+        if not self.stun_client.punch_hole(peer_ip, peer_udp_port):
+            logger.error(f"Failed to punch hole to {peer_ip}:{peer_udp_port}")
             return False
 
         # Store peer information
         self.peers[peer_id] = {
-            'addr': (peer_ip, peer_port),
+            'addr': (peer_ip, peer_udp_port),  # UDP address for peer communication
+            'tcp_port': peer_tcp_port,  # TCP port for file transfers
             'public_key': None,
             'connected': False,
             'last_seen': time.time()
         }
 
-        # Send hello message with our public key
+        # Send hello message with our public key and TCP port
         hello_msg = {
             'type': 'hello',
             'node_id': self.node_id,
-            'public_key': self.crypto_manager.get_public_key_pem().decode()
+            'public_key': self.crypto_manager.get_public_key_pem().decode(),
+            'tcp_port': self.tcp_file_transfer.tcp_port  # Include our TCP port
         }
 
         hello_json = json.dumps(hello_msg).encode()
-        self.socket.sendto(hello_json, (peer_ip, peer_port))
+        self.socket.sendto(hello_json, (peer_ip, peer_udp_port))
 
-        # Wait for response
+        # Wait for response with retry mechanism
         logger.info(f"Waiting for response from peer {peer_id}")
 
-        # Start a thread to keep sending hello messages until we get a response
         def keep_trying():
             attempts = 0
             while attempts < 10 and peer_id in self.peers and not self.peers[peer_id].get('connected'):
@@ -151,10 +152,11 @@ class P2PNode:
                     hello_msg = {
                         'type': 'hello',
                         'node_id': self.node_id,
-                        'public_key': self.crypto_manager.get_public_key_pem().decode()
+                        'public_key': self.crypto_manager.get_public_key_pem().decode(),
+                        'tcp_port': self.tcp_file_transfer.tcp_port
                     }
                     hello_json = json.dumps(hello_msg).encode()
-                    self.socket.sendto(hello_json, (peer_ip, peer_port))
+                    self.socket.sendto(hello_json, (peer_ip, peer_udp_port))
                     logger.info(f"Resending hello to peer {peer_id} (attempt {attempts + 2}/10)")
                 attempts += 1
 
@@ -167,14 +169,11 @@ class P2PNode:
         retry_thread.daemon = True
         retry_thread.start()
 
-        # We'll wait for the response in the message handling thread
-        # The connection will be marked as successful when we receive a hello_ack
-
         return True
 
     def send_file(self, peer_id: str, file_path: str) -> Optional[str]:
         """
-        Send a file to a peer.
+        Send a file to a peer using TCP.
 
         Args:
             peer_id: Unique identifier for the peer
@@ -187,17 +186,27 @@ class P2PNode:
             logger.error(f"Peer {peer_id} is not connected")
             return None
 
-        peer_addr = self.peers[peer_id]['addr']
+        peer_ip = self.peers[peer_id]['addr'][0]
+        peer_tcp_port = self.peers[peer_id].get('tcp_port')
+
+        if not peer_tcp_port:
+            logger.error(f"Peer {peer_id} TCP port unknown")
+            return None
+
+        if not os.path.exists(file_path):
+            logger.error(f"File not found: {file_path}")
+            return None
 
         try:
-            transfer_id = self.file_transfer.send_file(
+            transfer_id = self.tcp_file_transfer.send_file(
                 file_path,
                 peer_id,
-                peer_addr,
+                peer_ip,
+                peer_tcp_port,
                 self._on_transfer_progress
             )
 
-            logger.info(f"Started file transfer {transfer_id} to peer {peer_id}")
+            logger.info(f"Started TCP file transfer {transfer_id} to peer {peer_id}")
             return transfer_id
 
         except Exception as e:
@@ -206,7 +215,7 @@ class P2PNode:
 
     def send_message(self, peer_id: str, message: str) -> bool:
         """
-        Send a simple text message to a peer.
+        Send a simple text message to a peer via UDP.
 
         Args:
             peer_id: Unique identifier for the peer
@@ -218,6 +227,7 @@ class P2PNode:
         if peer_id not in self.peers or not self.peers[peer_id].get('connected'):
             logger.error(f"Peer {peer_id} is not connected")
             return False
+
         msg = {
             'type': 'test_message',
             'from': self.node_id,
@@ -241,7 +251,7 @@ class P2PNode:
 
     def get_transfer_status(self, transfer_id: str) -> Dict:
         """
-        Get the status of a file transfer.
+        Get the status of a TCP file transfer.
 
         Args:
             transfer_id: Unique transfer ID
@@ -249,38 +259,11 @@ class P2PNode:
         Returns:
             Transfer status information
         """
-        if transfer_id not in self.file_transfer.transfers:
-            return {'status': 'unknown'}
+        return self.tcp_file_transfer.get_transfer_status(transfer_id)
 
-        transfer = self.file_transfer.transfers[transfer_id]
-
-        # Calculate progress percentage
-        if transfer['total_chunks'] > 0:
-            if 'chunks_sent' in transfer:
-                progress = (transfer['chunks_sent'] / transfer['total_chunks']) * 100
-            else:
-                progress = (transfer['chunks_received'] / transfer['total_chunks']) * 100
-        else:
-            progress = 0
-
-        # Calculate transfer speed
-        if transfer['status'] == 'completed' and 'end_time' in transfer and 'start_time' in transfer:
-            duration = transfer['end_time'] - transfer['start_time']
-            if duration > 0:
-                speed = transfer['file_size'] / duration / 1024  # KB/s
-            else:
-                speed = 0
-        else:
-            speed = 0
-
-        return {
-            'transfer_id': transfer_id,
-            'file_name': transfer['file_name'],
-            'file_size': transfer['file_size'],
-            'status': transfer['status'],
-            'progress': progress,
-            'speed': speed
-        }
+    def list_transfers(self) -> Dict[str, Dict]:
+        """Get status of all file transfers"""
+        return self.tcp_file_transfer.list_transfers()
 
     def get_peer_info(self) -> Dict:
         """
@@ -292,153 +275,93 @@ class P2PNode:
         return {
             'node_id': self.node_id,
             'external_ip': self.external_ip,
-            'external_port': self.external_port,
-            'nat_type': self.nat_type
+            'external_port': self.external_port,  # UDP port for peer communication
+            'tcp_port': self.tcp_file_transfer.tcp_port,  # TCP port for file transfers
+            'nat_type': str(self.nat_type) if self.nat_type else 'Unknown'
         }
 
+    def list_peers(self) -> Dict[str, Dict]:
+        """Get information about connected peers"""
+        return {pid: {
+            'addr': peer['addr'],
+            'tcp_port': peer.get('tcp_port'),
+            'connected': peer.get('connected', False),
+            'last_seen': peer.get('last_seen', 0)
+        } for pid, peer in self.peers.items()}
+
     def _handle_messages(self) -> None:
-        """Handle incoming messages in a loop"""
+        """Handle incoming UDP messages for peer communication (not file transfers)"""
         while self.running:
             try:
                 data, addr = self.socket.recvfrom(65536)  # Max UDP packet size
 
-                # First identify the peer based on address
-                peer_id = None
-                for pid, peer in self.peers.items():
-                    if peer['addr'] == addr:
-                        peer_id = pid
-                        break
-
-                # If we're expecting binary data, process it directly
-                if self.expecting_binary:
-                    # Reset the flag immediately
-                    self.expecting_binary = False
-
-                    if peer_id and self.expected_transfer_id is not None and self.expected_chunk_index is not None:
-                        logger.debug(
-                            f"Processing expected binary chunk data for transfer {self.expected_transfer_id}, chunk {self.expected_chunk_index}")
-
-                        # Process the binary data directly
-                        self.file_transfer._process_chunk(
-                            self.expected_transfer_id,
-                            self.expected_chunk_index,
-                            peer_id,
-                            addr,
-                            data
-                        )
-
-                        # Clear the expected values
-                        self.expected_transfer_id = None
-                        self.expected_chunk_index = None
-                        self.expected_chunk_size = 0
-                    else:
-                        logger.warning(f"Received binary data but missing context information")
-
-                    continue  # Skip further processing for expected binary data
-
-                # For all other data, first check if it looks like text/JSON
+                # Only handle peer communication messages, not file transfers
                 try:
-                    # Try to decode as UTF-8
                     text_data = data.decode('utf-8')
+                    message = json.loads(text_data)
+                    message_type = message.get('type')
 
-                    # Try to parse as JSON
-                    try:
-                        message = json.loads(text_data)
-                        message_type = message.get('type')
-
-                        # Handle known message types
-                        if message_type == 'hello':
-                            self._handle_hello(message, addr)
-                        elif message_type == 'hello_ack':
-                            self._handle_hello_ack(message, addr)
-                        elif message_type == 'key_exchange':
-                            self._handle_key_exchange(message, addr)
-                        elif message_type == 'key_exchange_ack':
-                            self._handle_key_exchange_ack(message, addr)
-                        elif message_type == 'file_chunk':
-                            # Set up to receive binary data next
-                            self.expecting_binary = True
-                            self.expected_chunk_size = message.get('chunk_size', 0)
-                            self.expected_transfer_id = message.get('transfer_id')
-                            self.expected_chunk_index = message.get('chunk_index')
-
-                            if peer_id:
-                                # Store the chunk header information
-                                self.file_transfer._handle_file_chunk(message, addr, peer_id)
-                                logger.debug(
-                                    f"Received header for chunk {self.expected_chunk_index} of transfer {self.expected_transfer_id}")
-                            else:
-                                logger.warning(f"Received file chunk from unknown peer {addr}")
-                        elif message_type == 'test_message':
-                            # Handle test message
-                            peer_id_from = message.get('from', None)
-                            msg_text = message.get('message', '')
-                            if peer_id_from:
-                                self.incoming_messages.put({'peer_id': peer_id_from, 'message': msg_text})
-                            else:
-                                logger.info(f"Received test message from unknown peer: {addr}")
-                        elif peer_id:
-                            # Handle other file transfer related messages by passing raw data
-                            # This includes: file_init, file_init_ack, chunk_ack, window_ack, selective_nack, file_end, file_end_ack
-                            self.file_transfer.handle_message(data, addr, peer_id)
+                    # Handle peer communication messages only
+                    if message_type == 'hello':
+                        self._handle_hello(message, addr)
+                    elif message_type == 'hello_ack':
+                        self._handle_hello_ack(message, addr)
+                    elif message_type == 'key_exchange':
+                        self._handle_key_exchange(message, addr)
+                    elif message_type == 'key_exchange_ack':
+                        self._handle_key_exchange_ack(message, addr)
+                    elif message_type == 'test_message':
+                        peer_id_from = message.get('from', None)
+                        msg_text = message.get('message', '')
+                        if peer_id_from:
+                            self.incoming_messages.put({'peer_id': peer_id_from, 'message': msg_text})
                         else:
-                            logger.warning(f"Received message from unknown peer {addr}: {message_type}")
-
-                    except json.JSONDecodeError:
-                        # Valid UTF-8 but not JSON - might be a text protocol message
-                        logger.debug(f"Received non-JSON text from {addr}: {text_data[:100]}...")
-                        if peer_id:
-                            # Pass to file transfer handler as raw bytes
-                            self.file_transfer.handle_message(data, addr, peer_id)
-
-                except UnicodeDecodeError:
-                    # This is binary data that can't be decoded as UTF-8
-                    logger.debug(f"Received binary data from {addr}, length: {len(data)} bytes")
-
-                    if peer_id:
-                        # This might be an unexpected binary chunk or encrypted data
-                        # Let the file transfer handler deal with it
-                        self.file_transfer.handle_binary_data(data, addr, peer_id)
+                            logger.info(f"Received test message from unknown peer: {addr}")
                     else:
-                        logger.warning(f"Received binary data from unknown peer {addr}")
+                        logger.debug(f"Unknown message type: {message_type}")
+
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.debug(f"Received non-JSON data from {addr}")
 
             except socket.timeout:
                 continue  # Just continue the loop on timeout
             except Exception as e:
-                logger.error(f"Error handling message: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                if self.running:
+                    logger.error(f"Error handling message: {e}")
 
     def _handle_hello(self, message: Dict, addr: Tuple[str, int]) -> None:
         """
         Handle hello message from a peer.
 
         Args:
-            message: Hello message
+            message: Hello message containing peer info
             addr: Sender's address
         """
         peer_id = message.get('node_id')
         peer_public_key_pem = message.get('public_key')
+        peer_tcp_port = message.get('tcp_port')  # Get TCP port from hello message
 
         if not peer_id or not peer_public_key_pem:
             logger.error("Invalid hello message")
             return
 
-        logger.info(f"Received hello from peer {peer_id} at {addr}")
+        logger.info(f"Received hello from peer {peer_id} at {addr} (TCP: {peer_tcp_port})")
 
-        # Store peer information
+        # Store peer information including TCP port
         self.peers[peer_id] = {
             'addr': addr,
+            'tcp_port': peer_tcp_port,  # Store TCP port for file transfers
             'public_key': self.crypto_manager.load_peer_public_key(peer_public_key_pem.encode()),
             'connected': True,
             'last_seen': time.time()
         }
 
-        # Send hello acknowledgment
+        # Send hello acknowledgment with our TCP port
         hello_ack = {
             'type': 'hello_ack',
             'node_id': self.node_id,
-            'public_key': self.crypto_manager.get_public_key_pem().decode()
+            'public_key': self.crypto_manager.get_public_key_pem().decode(),
+            'tcp_port': self.tcp_file_transfer.tcp_port  # Include our TCP port
         }
 
         hello_ack_json = json.dumps(hello_ack).encode()
@@ -457,18 +380,20 @@ class P2PNode:
         """
         peer_id = message.get('node_id')
         peer_public_key_pem = message.get('public_key')
+        peer_tcp_port = message.get('tcp_port')  # Get TCP port
 
         if not peer_id or not peer_public_key_pem:
             logger.error("Invalid hello_ack message")
             return
 
-        logger.info(f"Received hello_ack from peer {peer_id}")
+        logger.info(f"Received hello_ack from peer {peer_id} (TCP: {peer_tcp_port})")
 
-        # Update peer information
+        # Update peer information including TCP port
         if peer_id in self.peers:
             self.peers[peer_id]['public_key'] = self.crypto_manager.load_peer_public_key(
                 peer_public_key_pem.encode()
             )
+            self.peers[peer_id]['tcp_port'] = peer_tcp_port  # Store TCP port
             self.peers[peer_id]['connected'] = True
             self.peers[peer_id]['last_seen'] = time.time()
 
