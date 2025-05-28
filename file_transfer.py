@@ -1,27 +1,25 @@
 """
-Enhanced reliable UDP file transfer using the srudp library.
-Simple and reliable file transfer with proper library usage.
+Enhanced reliable UDP file transfer using the rudp library.
+Clean implementation that relies on library for all UDP reliability.
 """
 
 import json
 import logging
-import math
 import os
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
-import socket
 
 try:
-    from srudp import SecureReliableSocket
+    import rudp
 except ImportError:
-    print("Installing srudp library...")
+    print("Installing rudp library...")
     import subprocess
     import sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "srudp"])
-    from srudp import SecureReliableSocket
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "rudp"])
+    import rudp
 
 logger = logging.getLogger(__name__)
 
@@ -34,42 +32,172 @@ FILE_END_ACK = "file_end_ack"
 
 
 class FileTransfer:
-    """Simple and reliable file transfer using srudp library"""
+    """Simple and reliable file transfer using rudp library"""
 
     # Configuration
-    DEFAULT_CHUNK_SIZE = 64 * 1024  # 64 KiB - larger chunks since reliability is handled by srudp
+    DEFAULT_CHUNK_SIZE = 64 * 1024  # 64 KiB
     CONNECTION_TIMEOUT = 30.0
     TRANSFER_TIMEOUT = 300.0  # 5 minutes
 
-    def __init__(self, sock, crypto_manager):
-        self.base_socket = sock  # Original UDP socket (for compatibility)
+    def __init__(self, base_socket, crypto_manager):
+        self.base_socket = base_socket
         self.crypto = crypto_manager
         self.lock = threading.Lock()
         self.transfers: Dict[str, Dict[str, Any]] = {}
         self.save_dir: Path = Path.cwd()
         self.progress_callback: Optional[Callable[[str, int, int], None]] = None
-        self.reliable_connections: Dict[str, SecureReliableSocket] = {}  # peer_id -> srudp socket
+
+        # RUDP server for incoming connections
+        self.rudp_server = None
+        self.server_thread = None
+        self.is_running = False
+
+        self._start_server()
+
+    def _start_server(self):
+        """Start RUDP server for incoming file transfers"""
+        try:
+            # Get a free port for RUDP server
+            server_port = self.base_socket.getsockname()[1] + 1
+
+            self.rudp_server = rudp.RUDPServer(('0.0.0.0', server_port))
+            self.rudp_server.settimeout(1.0)  # For periodic checks
+
+            self.is_running = True
+            self.server_thread = threading.Thread(target=self._server_worker, daemon=True)
+            self.server_thread.start()
+
+            logger.info(f"RUDP server started on port {server_port}")
+
+        except Exception as e:
+            logger.error(f"Failed to start RUDP server: {e}")
+
+    def _server_worker(self):
+        """Server worker to handle incoming RUDP connections"""
+        while self.is_running and self.rudp_server:
+            try:
+                conn, addr = self.rudp_server.accept()
+                logger.info(f"Accepted RUDP connection from {addr}")
+
+                # Handle connection in separate thread
+                handler_thread = threading.Thread(
+                    target=self._handle_incoming_connection,
+                    args=(conn, addr),
+                    daemon=True
+                )
+                handler_thread.start()
+
+            except rudp.timeout:
+                continue  # Timeout is expected for periodic checks
+            except Exception as e:
+                if self.is_running:
+                    logger.error(f"Server error: {e}")
+
+    def _handle_incoming_connection(self, conn, addr):
+        """Handle incoming file transfer connection"""
+        try:
+            # Receive file initialization
+            init_data = conn.recv(4096)
+            init_msg = json.loads(init_data.decode())
+
+            if init_msg.get("type") != FILE_INIT:
+                logger.error("Expected FILE_INIT message")
+                return
+
+            transfer_id = init_msg["transfer_id"]
+            peer_id = init_msg.get("peer_id", "unknown")
+
+            with self.lock:
+                self.transfers[transfer_id] = {
+                    "direction": "in",
+                    "file_name": init_msg["file_name"],
+                    "file_size": init_msg["file_size"],
+                    "chunk_size": init_msg["chunk_size"],
+                    "total_chunks": init_msg["total_chunks"],
+                    "chunks_received": 0,
+                    "status": "receiving",
+                    "peer_addr": addr,
+                    "peer_id": peer_id,
+                    "start_time": time.time(),
+                }
+
+            logger.info(f"Receiving file {init_msg['file_name']} ({init_msg['file_size']} bytes)")
+
+            # Send acknowledgment
+            ack_msg = {"type": FILE_INIT_ACK, "transfer_id": transfer_id}
+            conn.send(json.dumps(ack_msg).encode())
+
+            # Receive file
+            self._receive_file_data(conn, transfer_id)
+
+        except Exception as e:
+            logger.error(f"Error handling incoming connection: {e}")
+        finally:
+            try:
+                conn.close()
+            except:
+                pass
+
+    def _receive_file_data(self, conn, transfer_id: str):
+        """Receive file data through RUDP connection"""
+        with self.lock:
+            tf = self.transfers[transfer_id]
+
+        dest_path = self.save_dir / tf["file_name"]
+
+        try:
+            with open(dest_path, "wb") as file_handle:
+                chunks_received = 0
+                last_progress_update = time.time()
+
+                while chunks_received < tf["total_chunks"]:
+                    # Receive chunk message
+                    chunk_data = conn.recv(tf["chunk_size"] + 1024)  # Extra space for headers
+                    if not chunk_data:
+                        break
+
+                    try:
+                        chunk_msg = json.loads(chunk_data.decode())
+                    except:
+                        # Assume it's raw file data if not JSON
+                        if tf.get("receiving_data", False):
+                            # Decrypt and write
+                            plaintext = self._decrypt(tf["peer_id"], chunk_data)
+                            file_handle.write(plaintext)
+                            chunks_received += 1
+                        continue
+
+                    if chunk_msg.get("type") == FILE_CHUNK:
+                        tf["receiving_data"] = True
+                        # Next message will be the actual data
+                        continue
+
+                    elif chunk_msg.get("type") == FILE_END:
+                        # Send final ACK
+                        final_ack = {"type": FILE_END_ACK, "transfer_id": transfer_id}
+                        conn.send(json.dumps(final_ack).encode())
+                        break
+
+                with self.lock:
+                    tf["chunks_received"] = chunks_received
+                    tf["status"] = "completed"
+                    tf["end_time"] = time.time()
+
+                duration = tf["end_time"] - tf["start_time"]
+                speed = tf["file_size"] / duration / 1024 if duration > 0 else 0
+                logger.info(f"Download completed - {speed:.2f} KB/s")
+
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            with self.lock:
+                tf["status"] = "failed"
+                tf["error"] = str(e)
 
     def receive_file(self, save_dir: str, progress_callback: Callable[[str, int, int], None]):
         """Configure where incoming files are stored and how to report progress."""
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.progress_callback = progress_callback
-
-    def get_reliable_connection(self, peer_addr: Tuple[str, int]) -> SecureReliableSocket:
-        """Get or create a reliable connection to peer"""
-        peer_key = f"{peer_addr[0]}:{peer_addr[1]}"
-
-        with self.lock:
-            if peer_key in self.reliable_connections:
-                return self.reliable_connections[peer_key]
-
-            # Create new reliable socket
-            reliable_sock = SecureReliableSocket()
-            reliable_sock.settimeout(self.CONNECTION_TIMEOUT)
-
-            self.reliable_connections[peer_key] = reliable_sock
-            return reliable_sock
 
     def send_file(self, file_path: str, peer_id: str, peer_addr: Tuple[str, int],
                   progress_callback: Callable[[str, int, int], None]) -> str:
@@ -80,7 +208,7 @@ class FileTransfer:
 
         transfer_id = str(uuid.uuid4())
         file_size = os.path.getsize(file_path)
-        total_chunks = math.ceil(file_size / self.DEFAULT_CHUNK_SIZE)
+        total_chunks = (file_size + self.DEFAULT_CHUNK_SIZE - 1) // self.DEFAULT_CHUNK_SIZE
 
         with self.lock:
             self.transfers[transfer_id] = {
@@ -97,31 +225,33 @@ class FileTransfer:
                 "progress_cb": progress_callback,
             }
 
-        # Start upload worker thread
+        # Start upload in separate thread
         upload_thread = threading.Thread(
-            target=self._upload_worker,
+            target=self._upload_file,
             args=(transfer_id,),
             daemon=True
         )
         upload_thread.start()
         return transfer_id
 
-    def _upload_worker(self, transfer_id: str):
-        """Upload worker using srudp for reliable transmission"""
+    def _upload_file(self, transfer_id: str):
+        """Upload file using RUDP client connection"""
         with self.lock:
             tf = self.transfers[transfer_id]
 
         peer_addr = tf["peer_addr"]
-        peer_id = tf["peer_id"]
-        reliable_sock = None
+        # Assume peer is listening on port + 1
+        rudp_peer_addr = (peer_addr[0], peer_addr[1] + 1)
 
+        client = None
         try:
-            # Create reliable connection
-            reliable_sock = self.get_reliable_connection(peer_addr)
+            # Create RUDP client connection
+            client = rudp.RUDPClient()
+            client.settimeout(self.CONNECTION_TIMEOUT)
 
-            logger.info(f"Connecting to {peer_addr} for file transfer...")
-            reliable_sock.connect(peer_addr)
-            logger.info(f"Connected to {peer_addr}")
+            logger.info(f"Connecting to {rudp_peer_addr} via RUDP...")
+            client.connect(rudp_peer_addr)
+            logger.info(f"Connected to {rudp_peer_addr}")
 
             with self.lock:
                 tf["status"] = "uploading"
@@ -134,24 +264,22 @@ class FileTransfer:
                 "file_size": tf["file_size"],
                 "chunk_size": self.DEFAULT_CHUNK_SIZE,
                 "total_chunks": tf["total_chunks"],
+                "peer_id": tf["peer_id"],
             }
 
-            init_data = json.dumps(init_msg).encode()
-            reliable_sock.send(init_data)
+            client.send(json.dumps(init_msg).encode())
             logger.info(f"Sent file init for {tf['file_name']}")
 
             # Wait for acknowledgment
-            ack_data = reliable_sock.recv(1024)
+            ack_data = client.recv(1024)
             ack_msg = json.loads(ack_data.decode())
 
             if ack_msg.get("type") != FILE_INIT_ACK:
                 raise Exception("Invalid acknowledgment received")
 
-            logger.info("Received file init acknowledgment")
+            logger.info("Received file init acknowledgment, starting transfer...")
 
             # Send file chunks
-            last_progress_update = time.time()
-
             with open(tf["file_path"], "rb") as file_handle:
                 for chunk_index in range(tf["total_chunks"]):
                     # Read chunk
@@ -160,33 +288,26 @@ class FileTransfer:
                         break
 
                     # Encrypt chunk
-                    encrypted_data = self._encrypt(peer_id, chunk_data)
+                    encrypted_data = self._encrypt(tf["peer_id"], chunk_data)
 
-                    # Create chunk message
+                    # Send chunk header
                     chunk_msg = {
                         "type": FILE_CHUNK,
                         "transfer_id": transfer_id,
                         "chunk_index": chunk_index,
                         "chunk_size": len(encrypted_data),
-                        "total_chunks": tf["total_chunks"],
                     }
-
-                    # Send chunk header
-                    chunk_header = json.dumps(chunk_msg).encode()
-                    reliable_sock.send(chunk_header)
+                    client.send(json.dumps(chunk_msg).encode())
 
                     # Send chunk data
-                    reliable_sock.send(encrypted_data)
+                    client.send(encrypted_data)
 
                     with self.lock:
                         tf["chunks_sent"] = chunk_index + 1
 
                     # Update progress
-                    now = time.time()
-                    if now - last_progress_update > 1.0:
-                        if tf["progress_cb"]:
-                            tf["progress_cb"](transfer_id, chunk_index + 1, tf["total_chunks"])
-                        last_progress_update = now
+                    if tf["progress_cb"]:
+                        tf["progress_cb"](transfer_id, chunk_index + 1, tf["total_chunks"])
 
                     logger.debug(f"Sent chunk {chunk_index + 1}/{tf['total_chunks']}")
 
@@ -196,15 +317,11 @@ class FileTransfer:
                             raise Exception("Transfer cancelled")
 
             # Send completion message
-            end_msg = {
-                "type": FILE_END,
-                "transfer_id": transfer_id,
-            }
-            end_data = json.dumps(end_msg).encode()
-            reliable_sock.send(end_data)
+            end_msg = {"type": FILE_END, "transfer_id": transfer_id}
+            client.send(json.dumps(end_msg).encode())
 
             # Wait for final acknowledgment
-            final_ack_data = reliable_sock.recv(1024)
+            final_ack_data = client.recv(1024)
             final_ack_msg = json.loads(final_ack_data.decode())
 
             if final_ack_msg.get("type") == FILE_END_ACK:
@@ -213,7 +330,7 @@ class FileTransfer:
                     tf["end_time"] = time.time()
                     duration = tf["end_time"] - tf["start_time"]
                     speed = tf["file_size"] / duration / 1024 if duration > 0 else 0
-                    logger.info(f"Upload of {tf['file_name']} completed - {speed:.2f} KB/s")
+                    logger.info(f"Upload completed - {speed:.2f} KB/s")
             else:
                 raise Exception("Invalid final acknowledgment")
 
@@ -223,175 +340,34 @@ class FileTransfer:
                 tf["status"] = "failed"
                 tf["error"] = str(e)
         finally:
-            if reliable_sock:
+            if client:
                 try:
-                    reliable_sock.close()
+                    client.close()
                 except:
                     pass
 
     def handle_message(self, data: bytes, addr: Tuple[str, int], peer_id: str):
-        """Handle incoming messages - mainly for file init over regular UDP"""
+        """Handle incoming messages (compatibility method)"""
+        # With RUDP, most handling is done through the server
+        # This method can be used for coordination messages if needed
         try:
             msg = json.loads(data.decode())
+            logger.debug(f"Received coordination message: {msg.get('type', 'unknown')}")
         except Exception:
-            logger.debug("handle_message: not JSON – ignoring")
-            return
-
-        mtype = msg.get("type")
-        if mtype == FILE_INIT:
-            self._handle_file_init(msg, addr, peer_id)
-
-    def _handle_file_init(self, msg: Dict[str, Any], addr: Tuple[str, int], peer_id: str):
-        """Handle file initialization and start reliable download"""
-        transfer_id = msg["transfer_id"]
-
-        with self.lock:
-            if transfer_id in self.transfers:
-                return  # Already handling
-
-            self.transfers[transfer_id] = {
-                "direction": "in",
-                "file_name": msg["file_name"],
-                "file_size": msg["file_size"],
-                "chunk_size": msg["chunk_size"],
-                "total_chunks": msg["total_chunks"],
-                "chunks_received": 0,
-                "status": "receiving",
-                "peer_addr": addr,
-                "peer_id": peer_id,
-                "start_time": time.time(),
-            }
-
-        logger.info(f"Incoming file {msg['file_name']} ({msg['file_size']} bytes) from {peer_id}")
-
-        # Start download worker
-        download_thread = threading.Thread(
-            target=self._download_worker,
-            args=(transfer_id,),
-            daemon=True
-        )
-        download_thread.start()
-
-    def _download_worker(self, transfer_id: str):
-        """Download worker using srudp for reliable reception"""
-        with self.lock:
-            tf = self.transfers[transfer_id]
-
-        peer_addr = tf["peer_addr"]
-        peer_id = tf["peer_id"]
-        reliable_sock = None
-
-        try:
-            # Create reliable socket for listening
-            reliable_sock = SecureReliableSocket()
-            reliable_sock.settimeout(self.CONNECTION_TIMEOUT)
-
-            # Bind to a local port for the peer to connect to
-            local_port = self.base_socket.getsockname()[1] + 1  # Use next port
-            reliable_sock.bind(('0.0.0.0', local_port))
-            reliable_sock.listen(1)
-
-            logger.info(f"Listening for reliable connection on port {local_port}")
-
-            # Send acknowledgment with our listening port
-            ack_msg = {
-                "type": FILE_INIT_ACK,
-                "transfer_id": transfer_id,
-                "reliable_port": local_port
-            }
-            ack_data = json.dumps(ack_msg).encode()
-            self.base_socket.sendto(ack_data, peer_addr)
-
-            # Accept reliable connection
-            conn, addr = reliable_sock.accept()
-            logger.info(f"Accepted reliable connection from {addr}")
-
-            # Prepare file for writing
-            dest_path = self.save_dir / tf["file_name"]
-
-            with open(dest_path, "wb") as file_handle:
-                chunks_received = 0
-                last_progress_update = time.time()
-
-                while chunks_received < tf["total_chunks"]:
-                    # Receive chunk header
-                    header_data = conn.recv(4096)
-                    if not header_data:
-                        break
-
-                    try:
-                        chunk_msg = json.loads(header_data.decode())
-                    except:
-                        break
-
-                    if chunk_msg.get("type") == FILE_CHUNK:
-                        chunk_size = chunk_msg["chunk_size"]
-                        chunk_index = chunk_msg["chunk_index"]
-
-                        # Receive chunk data
-                        chunk_data = conn.recv(chunk_size)
-                        if len(chunk_data) != chunk_size:
-                            raise Exception(f"Incomplete chunk data received")
-
-                        # Decrypt and write chunk
-                        try:
-                            plaintext = self._decrypt(peer_id, chunk_data)
-                            file_handle.write(plaintext)
-                            file_handle.flush()
-                        except Exception as e:
-                            raise Exception(f"Decryption failed: {e}")
-
-                        chunks_received += 1
-
-                        with self.lock:
-                            tf["chunks_received"] = chunks_received
-
-                        # Update progress
-                        now = time.time()
-                        if now - last_progress_update > 1.0:
-                            if self.progress_callback:
-                                self.progress_callback(transfer_id, chunks_received, tf["total_chunks"])
-                            last_progress_update = now
-
-                        logger.debug(f"Received chunk {chunk_index + 1}/{tf['total_chunks']}")
-
-                    elif chunk_msg.get("type") == FILE_END:
-                        # Transfer completed
-                        break
-
-            # Send final acknowledgment
-            final_ack = {"type": FILE_END_ACK, "transfer_id": transfer_id}
-            final_data = json.dumps(final_ack).encode()
-            conn.send(final_data)
-
-            with self.lock:
-                tf["status"] = "completed"
-                tf["end_time"] = time.time()
-                duration = tf["end_time"] - tf["start_time"]
-                speed = tf["file_size"] / duration / 1024 if duration > 0 else 0
-                logger.info(f"Download of {tf['file_name']} completed - {speed:.2f} KB/s")
-
-        except Exception as e:
-            logger.error(f"Download failed for transfer {transfer_id}: {e}")
-            with self.lock:
-                tf["status"] = "failed"
-                tf["error"] = str(e)
-        finally:
-            if reliable_sock:
-                try:
-                    reliable_sock.close()
-                except:
-                    pass
+            pass
 
     def stop(self):
         """Stop the file transfer manager"""
-        with self.lock:
-            for sock in self.reliable_connections.values():
-                try:
-                    sock.close()
-                except:
-                    pass
-            self.reliable_connections.clear()
+        self.is_running = False
+
+        if self.rudp_server:
+            try:
+                self.rudp_server.close()
+            except:
+                pass
+
+        if self.server_thread:
+            self.server_thread.join(timeout=2.0)
 
     def cancel_transfer(self, transfer_id: str) -> bool:
         """Cancel an ongoing transfer"""
@@ -405,7 +381,7 @@ class FileTransfer:
         return False
 
     def get_transfer_status(self, transfer_id: str) -> Dict:
-        """Get transfer status - compatible with existing API"""
+        """Get transfer status"""
         with self.lock:
             if transfer_id not in self.transfers:
                 return {'status': 'unknown'}
@@ -450,15 +426,15 @@ class FileTransfer:
             return self.crypto.decrypt_data(peer_id, ciphertext)
         return ciphertext
 
-    # Legacy compatibility methods for existing P2P node
+    # Legacy compatibility methods
     def handle_binary_data(self, *args):
-        """Legacy method - not needed with reliable sockets"""
+        """Legacy method - not needed with RUDP"""
         pass
 
     def _handle_file_chunk(self, *args):
-        """Legacy method - handled by reliable connection"""
+        """Legacy method - handled by RUDP connection"""
         pass
 
     def _process_chunk(self, *args):
-        """Legacy method - handled by reliable connection"""
+        """Legacy method - handled by RUDP connection"""
         pass
