@@ -94,7 +94,7 @@ class FileTransfer:
             time.sleep(0.1)
 
         # 4) Create and configure KCP for this transfer
-        conv = uuid.UUID(transfer_id).int & 0xFFFFFFFF
+        conv = uuid.UUID(transfer_id).int & 0x7FFFFFFF
 
         def _upload_output(_kcp, data: bytes):
             self.socket.sendto(data, peer_addr)
@@ -170,7 +170,7 @@ class FileTransfer:
         fh = dest.open('wb')
 
         # Create KCP for this transfer
-        conv = uuid.UUID(transfer_id).int & 0xFFFFFFFF
+        conv = uuid.UUID(transfer_id).int & 0x7FFFFFFF
 
         def _recv_output(_kcp, data: bytes):
             self.socket.sendto(data, addr)
