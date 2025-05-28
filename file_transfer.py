@@ -95,8 +95,11 @@ class FileTransfer:
 
         # 4) Create and configure KCP for this transfer
         conv = uuid.UUID(transfer_id).int & 0xFFFFFFFF
-        kcp = KCP(conv)
-        kcp.set_output(lambda buf: self.socket.sendto(buf, peer_addr))
+
+        def _upload_output(_kcp, data: bytes):
+            self.socket.sendto(data, peer_addr)
+
+        kcp = KCP(conv, _upload_output)
         sess['kcp'] = kcp
 
         # 5) Stream encrypted file data over KCP
@@ -168,8 +171,11 @@ class FileTransfer:
 
         # Create KCP for this transfer
         conv = uuid.UUID(transfer_id).int & 0xFFFFFFFF
-        kcp = KCP(conv)
-        kcp.set_output(lambda buf: self.socket.sendto(buf, addr))
+
+        def _recv_output(_kcp, data: bytes):
+            self.socket.sendto(data, addr)
+
+        kcp = KCP(conv, _recv_output)
 
         # Store session
         self._recv_sessions[transfer_id] = {
