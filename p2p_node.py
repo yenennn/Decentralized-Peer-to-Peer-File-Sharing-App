@@ -359,7 +359,7 @@ class P2PNode:
                         if peer_id:
                             # Store the chunk header information
                             self.file_transfer._handle_file_chunk(message, addr, peer_id)
-                            logger.info(
+                            logger.debug(  # Changed from logger.info to reduce spam
                                 f"Received header for chunk {self.expected_chunk_index} of transfer {self.expected_transfer_id}")
                         else:
                             logger.warning(f"Received file chunk from unknown peer {addr}")
@@ -373,6 +373,7 @@ class P2PNode:
                             logger.info(f"Received test message from unknown peer: {addr}")
                     elif peer_id:
                         # Handle other file transfer related messages
+                        # This now includes: window_ack, selective_nack, and all other enhanced file transfer messages
                         self.file_transfer.handle_message(data, addr, peer_id)
                     else:
                         logger.warning(f"Received message from unknown peer {addr}")
