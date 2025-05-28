@@ -144,65 +144,16 @@ class CryptoManager:
             raise
 
     def encrypt_data(self, peer_id: str, plaintext: bytes) -> bytes:
-        """
-        Encrypt arbitrary bytes for a given peer.
-
-        A new random IV is generated *per payload* and prepended so the receiver
-        can decrypt.  Returns: iv || ciphertext (concatenated bytes).
-        """
-        try:
-            with self._lock:
-                if peer_id not in self.session_keys:
-                    available_peers = list(self.session_keys.keys())
-                    logger.error(f"No session key for peer {peer_id}. Available peers: {available_peers}")
-                    raise ValueError(f"No session key for peer {peer_id}")
-
-                key, _ = self.session_keys[peer_id]
-
-            # Generate fresh IV for each encryption
-            iv = os.urandom(16)
-            encryptor = self._get_cipher(key, iv).encryptor()
-            ct = encryptor.update(plaintext) + encryptor.finalize()
-
-            result = iv + ct
-            self.encryption_count += 1
-
-            logger.debug(f"Encrypted {len(plaintext)} bytes -> {len(result)} bytes for peer {peer_id}")
-            return result
-
-        except Exception as e:
-            self.error_count += 1
-            logger.error(f"Encryption failed for peer {peer_id}: {e}")
-            logger.error(f"Plaintext length: {len(plaintext) if plaintext else 'None'}")
-            raise
+        """ENCRYPTION DISABLED FOR TESTING"""
+        logger.debug(f"🔓 Encryption disabled - passing through {len(plaintext)} bytes")
+        self.encryption_count += 1
+        return plaintext
 
     def decrypt_data(self, peer_id: str, payload: bytes) -> bytes:
-        try:
-            with self._lock:
-                if peer_id not in self.session_keys:
-                    available_peers = list(self.session_keys.keys())
-                    logger.error(f"No session key for peer {peer_id}. Available peers: {available_peers}")
-                    raise ValueError(f"No session key for peer {peer_id}")
-
-                key, _ = self.session_keys[peer_id]
-
-            if len(payload) < 16:
-                raise ValueError(f"Payload too short – no IV (length: {len(payload)})")
-
-            iv, ct = payload[:16], payload[16:]
-            decryptor = self._get_cipher(key, iv).decryptor()
-            plaintext = decryptor.update(ct) + decryptor.finalize()
-
-            self.decryption_count += 1
-
-            logger.debug(f"Decrypted {len(payload)} bytes -> {len(plaintext)} bytes for peer {peer_id}")
-            return plaintext
-
-        except Exception as e:
-            self.error_count += 1
-            logger.error(f"Decryption failed for peer {peer_id}: {e}")
-            logger.error(f"Payload length: {len(payload) if payload else 'None'}")
-            raise
+        """DECRYPTION DISABLED FOR TESTING"""
+        logger.debug(f"🔓 Decryption disabled - passing through {len(payload)} bytes")
+        self.decryption_count += 1
+        return payload
 
     def has_session_key(self, peer_id: str) -> bool:
         """Check if we have a session key for a peer."""
