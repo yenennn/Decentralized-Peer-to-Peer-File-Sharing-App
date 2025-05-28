@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import uuid
+import ipaddress
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Set, List
 from collections import defaultdict
@@ -443,9 +444,9 @@ class FileTransfer:
                     protocol.set_progress_callback(self.progress_callback)
                 return protocol
 
-            # Start server
+            # Start server - use string for host, not IP address object
             server = await serve(
-                "0.0.0.0",
+                "0.0.0.0",  # Use string directly, not ipaddress object
                 port,
                 configuration=configuration,
                 create_protocol=create_protocol
@@ -457,6 +458,8 @@ class FileTransfer:
 
         except Exception as e:
             logger.error(f"Failed to start QUIC server on port {port}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
     async def stop_server(self, port: int):
@@ -476,9 +479,9 @@ class FileTransfer:
                 verify_mode=ssl.CERT_NONE  # Disable certificate verification for P2P
             )
 
-            # Connect to peer
+            # Connect to peer - use string directly for peer IP
             protocol = await connect(
-                peer_ip,
+                peer_ip,  # Use string directly
                 peer_port,
                 configuration=configuration,
                 create_protocol=QuicFileTransferProtocol
@@ -495,6 +498,8 @@ class FileTransfer:
 
         except Exception as e:
             logger.error(f"Failed to connect to peer {peer_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
     async def send_file(self, file_path: str, peer_id: str, peer_addr: Tuple[str, int],
@@ -568,7 +573,8 @@ class FileTransfer:
         ).add_extension(
             x509.SubjectAlternativeName([
                 x509.DNSName("localhost"),
-                x509.IPAddress("127.0.0.1"),
+                x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                x509.IPAddress(ipaddress.ip_address("0.0.0.0")),
             ]),
             critical=False,
         ).sign(private_key, hashes.SHA256())
