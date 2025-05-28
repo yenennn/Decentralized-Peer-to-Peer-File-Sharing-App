@@ -69,40 +69,60 @@ class P2PNode:
         Returns:
             Tuple of (external_ip, external_port, quic_port)
         """
-        # Discover NAT type and external IP/port using STUN
-        self.nat_type, self.external_ip, self.external_port = self.stun_client.discover_nat()
+        try:
+            # Discover NAT type and external IP/port using STUN
+            self.nat_type, self.external_ip, self.external_port = self.stun_client.discover_nat()
 
-        if not self.external_ip or not self.external_port:
-            raise RuntimeError("Failed to discover external IP and port")
+            if not self.external_ip or not self.external_port:
+                raise RuntimeError("Failed to discover external IP and port")
 
-        # Create UDP socket for peer discovery
-        self.socket = self.stun_client.create_socket()
+            # Ensure external_port is an integer
+            if isinstance(self.external_port, str):
+                self.external_port = int(self.external_port)
 
-        # Calculate external QUIC port (assumption: same NAT mapping offset)
-        self.external_quic_port = self.external_port + (self.quic_port - self.local_port)
+            # Create UDP socket for peer discovery
+            self.socket = self.stun_client.create_socket()
 
-        # Initialize QUIC-based file transfer manager
-        self.file_transfer = FileTransfer(self.crypto_manager)
-        self.file_transfer.receive_file(self.save_dir, self._on_transfer_progress)
+            # Get actual local port after socket creation
+            actual_local_port = self.socket.getsockname()[1]
+            if self.local_port == 0:
+                self.local_port = actual_local_port
 
-        # Start QUIC server in a separate thread
-        self._start_quic_server()
+            # Calculate QUIC port if not set
+            if self.quic_port == 4433:  # Default value
+                self.quic_port = self.local_port + 1000
 
-        # Start message handling thread for peer discovery
-        self.running = True
-        self.message_thread = threading.Thread(target=self._handle_messages)
-        self.message_thread.daemon = True
-        self.message_thread.start()
+            # Calculate external QUIC port (assumption: same NAT mapping offset)
+            port_offset = self.quic_port - self.local_port
+            self.external_quic_port = self.external_port + port_offset
 
-        logger.info(f"P2P node started with ID: {self.node_id}")
-        logger.info(f"NAT Type: {self.nat_type}")
-        logger.info(f"External IP: {self.external_ip}")
-        logger.info(f"External Port (UDP): {self.external_port}")
-        logger.info(f"External QUIC Port: {self.external_quic_port}")
-        logger.info(f"Local Port (UDP): {self.local_port}")
-        logger.info(f"Local QUIC Port: {self.quic_port}")
+            # Initialize QUIC-based file transfer manager
+            self.file_transfer = FileTransfer(self.crypto_manager)
+            self.file_transfer.receive_file(self.save_dir, self._on_transfer_progress)
 
-        return self.external_ip, self.external_port, self.external_quic_port
+            # Start QUIC server in a separate thread
+            self._start_quic_server()
+
+            # Start message handling thread for peer discovery
+            self.running = True
+            self.message_thread = threading.Thread(target=self._handle_messages)
+            self.message_thread.daemon = True
+            self.message_thread.start()
+
+            logger.info(f"P2P node started with ID: {self.node_id}")
+            logger.info(f"NAT Type: {self.nat_type}")
+            logger.info(f"External IP: {self.external_ip}")
+            logger.info(f"External Port (UDP): {self.external_port}")
+            logger.info(f"External QUIC Port: {self.external_quic_port}")
+            logger.info(f"Local Port (UDP): {self.local_port}")
+            logger.info(f"Local QUIC Port: {self.quic_port}")
+
+            return self.external_ip, self.external_port, self.external_quic_port
+
+        except Exception as e:
+            logger.error(f"Error starting P2P node: {e}")
+            self.stop()
+            raise
 
     def _start_quic_server(self):
         """Start the QUIC server in a separate thread"""
@@ -112,13 +132,19 @@ class P2PNode:
 
             try:
                 # Start QUIC server
-                self.quic_loop.run_until_complete(
+                success = self.quic_loop.run_until_complete(
                     self.file_transfer.start_server(self.quic_port)
                 )
-                # Keep the loop running
-                self.quic_loop.run_forever()
+                if success:
+                    logger.info(f"QUIC server started successfully on port {self.quic_port}")
+                    # Keep the loop running
+                    self.quic_loop.run_forever()
+                else:
+                    logger.error(f"Failed to start QUIC server on port {self.quic_port}")
             except Exception as e:
                 logger.error(f"QUIC server error: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
             finally:
                 self.quic_loop.close()
 
@@ -126,7 +152,7 @@ class P2PNode:
         self.quic_thread.start()
 
         # Wait a bit for server to start
-        time.sleep(1)
+        time.sleep(2)
 
     def stop(self) -> None:
         """Stop the P2P node"""
@@ -134,11 +160,14 @@ class P2PNode:
 
         # Stop QUIC server
         if self.quic_loop and self.quic_loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                self.file_transfer.stop_server(self.quic_port),
-                self.quic_loop
-            )
-            self.quic_loop.call_soon_threadsafe(self.quic_loop.stop)
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.file_transfer.stop_server(self.quic_port),
+                    self.quic_loop
+                )
+                self.quic_loop.call_soon_threadsafe(self.quic_loop.stop)
+            except Exception as e:
+                logger.error(f"Error stopping QUIC server: {e}")
 
         if self.socket:
             self.socket.close()
@@ -157,68 +186,80 @@ class P2PNode:
         Returns:
             True if connection was successful, False otherwise
         """
-        if peer_quic_port is None:
-            # Assume same offset as this node
-            peer_quic_port = peer_port + (self.quic_port - self.local_port)
+        try:
+            # Ensure peer_port is an integer
+            if isinstance(peer_port, str):
+                peer_port = int(peer_port)
 
-        logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_port} (QUIC: {peer_quic_port})")
+            if peer_quic_port is None:
+                # Assume same offset as this node
+                port_offset = self.quic_port - self.local_port
+                peer_quic_port = peer_port + port_offset
+            elif isinstance(peer_quic_port, str):
+                peer_quic_port = int(peer_quic_port)
 
-        # Perform UDP hole punching for discovery
-        if not self.stun_client.punch_hole(peer_ip, peer_port):
-            logger.error(f"Failed to punch hole to {peer_ip}:{peer_port}")
+            logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_port} (QUIC: {peer_quic_port})")
+
+            # Perform UDP hole punching for discovery
+            if not self.stun_client.punch_hole(peer_ip, peer_port):
+                logger.error(f"Failed to punch hole to {peer_ip}:{peer_port}")
+                return False
+
+            # Store peer information
+            self.peers[peer_id] = {
+                'addr': (peer_ip, peer_port),
+                'quic_port': peer_quic_port,
+                'public_key': None,
+                'connected': False,
+                'last_seen': time.time()
+            }
+
+            # Send hello message with our public key and QUIC port
+            hello_msg = {
+                'type': 'hello',
+                'node_id': self.node_id,
+                'public_key': self.crypto_manager.get_public_key_pem().decode(),
+                'quic_port': self.external_quic_port
+            }
+
+            hello_json = json.dumps(hello_msg).encode()
+            self.socket.sendto(hello_json, (peer_ip, peer_port))
+
+            # Wait for response
+            logger.info(f"Waiting for response from peer {peer_id}")
+
+            # Start a thread to keep sending hello messages until we get a response
+            def keep_trying():
+                attempts = 0
+                while attempts < 10 and peer_id in self.peers and not self.peers[peer_id].get('connected'):
+                    time.sleep(2)
+                    if peer_id in self.peers and not self.peers[peer_id].get('connected'):
+                        # Resend hello message
+                        hello_msg = {
+                            'type': 'hello',
+                            'node_id': self.node_id,
+                            'public_key': self.crypto_manager.get_public_key_pem().decode(),
+                            'quic_port': self.external_quic_port
+                        }
+                        hello_json = json.dumps(hello_msg).encode()
+                        self.socket.sendto(hello_json, (peer_ip, peer_port))
+                        logger.info(f"Resending hello to peer {peer_id} (attempt {attempts + 2}/10)")
+                    attempts += 1
+
+                if peer_id in self.peers and self.peers[peer_id].get('connected'):
+                    logger.info(f"Successfully connected to peer {peer_id}")
+                else:
+                    logger.warning(f"Failed to connect to peer {peer_id} after 10 attempts")
+
+            retry_thread = threading.Thread(target=keep_trying)
+            retry_thread.daemon = True
+            retry_thread.start()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error connecting to peer {peer_id}: {e}")
             return False
-
-        # Store peer information
-        self.peers[peer_id] = {
-            'addr': (peer_ip, peer_port),
-            'quic_port': peer_quic_port,
-            'public_key': None,
-            'connected': False,
-            'last_seen': time.time()
-        }
-
-        # Send hello message with our public key and QUIC port
-        hello_msg = {
-            'type': 'hello',
-            'node_id': self.node_id,
-            'public_key': self.crypto_manager.get_public_key_pem().decode(),
-            'quic_port': self.external_quic_port
-        }
-
-        hello_json = json.dumps(hello_msg).encode()
-        self.socket.sendto(hello_json, (peer_ip, peer_port))
-
-        # Wait for response
-        logger.info(f"Waiting for response from peer {peer_id}")
-
-        # Start a thread to keep sending hello messages until we get a response
-        def keep_trying():
-            attempts = 0
-            while attempts < 10 and peer_id in self.peers and not self.peers[peer_id].get('connected'):
-                time.sleep(2)
-                if peer_id in self.peers and not self.peers[peer_id].get('connected'):
-                    # Resend hello message
-                    hello_msg = {
-                        'type': 'hello',
-                        'node_id': self.node_id,
-                        'public_key': self.crypto_manager.get_public_key_pem().decode(),
-                        'quic_port': self.external_quic_port
-                    }
-                    hello_json = json.dumps(hello_msg).encode()
-                    self.socket.sendto(hello_json, (peer_ip, peer_port))
-                    logger.info(f"Resending hello to peer {peer_id} (attempt {attempts + 2}/10)")
-                attempts += 1
-
-            if peer_id in self.peers and self.peers[peer_id].get('connected'):
-                logger.info(f"Successfully connected to peer {peer_id}")
-            else:
-                logger.warning(f"Failed to connect to peer {peer_id} after 10 attempts")
-
-        retry_thread = threading.Thread(target=keep_trying)
-        retry_thread.daemon = True
-        retry_thread.start()
-
-        return True
 
     def send_file(self, peer_id: str, file_path: str) -> Optional[str]:
         """
@@ -260,6 +301,8 @@ class P2PNode:
 
         except Exception as e:
             logger.error(f"Error sending file via QUIC: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     def send_message(self, peer_id: str, message: str) -> bool:
@@ -340,6 +383,7 @@ class P2PNode:
         """Handle incoming UDP messages for peer discovery"""
         while self.running:
             try:
+                self.socket.settimeout(1.0)  # Add timeout to prevent blocking indefinitely
                 data, addr = self.socket.recvfrom(65536)
 
                 # First identify the peer based on address
@@ -382,9 +426,10 @@ class P2PNode:
             except socket.timeout:
                 continue
             except Exception as e:
-                logger.error(f"Error handling message: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                if self.running:  # Only log errors if we're still supposed to be running
+                    logger.error(f"Error handling message: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
 
     def _handle_hello(self, message: Dict, addr: Tuple[str, int]) -> None:
         """
@@ -396,11 +441,18 @@ class P2PNode:
         """
         peer_id = message.get('node_id')
         peer_public_key_pem = message.get('public_key')
-        peer_quic_port = message.get('quic_port', addr[1] + 1000)  # Default offset
+        peer_quic_port = message.get('quic_port')
 
         if not peer_id or not peer_public_key_pem:
             logger.error("Invalid hello message")
             return
+
+        # Calculate default QUIC port if not provided
+        if peer_quic_port is None:
+            port_offset = self.quic_port - self.local_port
+            peer_quic_port = addr[1] + port_offset
+        elif isinstance(peer_quic_port, str):
+            peer_quic_port = int(peer_quic_port)
 
         logger.info(f"Received hello from peer {peer_id} at {addr} (QUIC: {peer_quic_port})")
 
@@ -437,11 +489,18 @@ class P2PNode:
         """
         peer_id = message.get('node_id')
         peer_public_key_pem = message.get('public_key')
-        peer_quic_port = message.get('quic_port', addr[1] + 1000)  # Default offset
+        peer_quic_port = message.get('quic_port')
 
         if not peer_id or not peer_public_key_pem:
             logger.error("Invalid hello_ack message")
             return
+
+        # Calculate default QUIC port if not provided
+        if peer_quic_port is None:
+            port_offset = self.quic_port - self.local_port
+            peer_quic_port = addr[1] + port_offset
+        elif isinstance(peer_quic_port, str):
+            peer_quic_port = int(peer_quic_port)
 
         logger.info(f"Received hello_ack from peer {peer_id} (QUIC: {peer_quic_port})")
 
@@ -470,30 +529,34 @@ class P2PNode:
             logger.error(f"Cannot send session key to peer {peer_id}: missing public key")
             return
 
-        # Generate a new session key
-        key, iv = self.crypto_manager.generate_session_key()
+        try:
+            # Generate a new session key
+            key, iv = self.crypto_manager.generate_session_key()
 
-        # Encrypt the session key with the peer's public key
-        encrypted_key_package = self.crypto_manager.encrypt_session_key(
-            self.peers[peer_id]['public_key'],
-            key,
-            iv
-        )
+            # Encrypt the session key with the peer's public key
+            encrypted_key_package = self.crypto_manager.encrypt_session_key(
+                self.peers[peer_id]['public_key'],
+                key,
+                iv
+            )
 
-        # Store the session key for this peer
-        self.crypto_manager.store_peer_session_key(peer_id, key, iv)
+            # Store the session key for this peer
+            self.crypto_manager.store_peer_session_key(peer_id, key, iv)
 
-        # Send the encrypted session key
-        key_exchange = {
-            'type': 'key_exchange',
-            'node_id': self.node_id,
-            'encrypted_key': base64.b64encode(encrypted_key_package).decode()
-        }
+            # Send the encrypted session key
+            key_exchange = {
+                'type': 'key_exchange',
+                'node_id': self.node_id,
+                'encrypted_key': base64.b64encode(encrypted_key_package).decode()
+            }
 
-        key_exchange_json = json.dumps(key_exchange).encode()
-        self.socket.sendto(key_exchange_json, self.peers[peer_id]['addr'])
+            key_exchange_json = json.dumps(key_exchange).encode()
+            self.socket.sendto(key_exchange_json, self.peers[peer_id]['addr'])
 
-        logger.info(f"Sent session key to peer {peer_id}")
+            logger.info(f"Sent session key to peer {peer_id}")
+
+        except Exception as e:
+            logger.error(f"Error sending session key to peer {peer_id}: {e}")
 
     def _handle_key_exchange(self, message: Dict, addr: Tuple[str, int]) -> None:
         """
