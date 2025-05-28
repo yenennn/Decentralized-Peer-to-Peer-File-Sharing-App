@@ -9,8 +9,9 @@ import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, Optional, Tuple, Set, List
+import scapy.all
 
-from scapy.all import IP, UDP, Raw, send, sniff, conf
+from scapy.all import *
 
 import logging
 logger = logging.getLogger(__name__)
