@@ -245,7 +245,7 @@ def main():
                         print(f"❌ Peer {peer_id} is not connected")
                         continue
 
-                    if node.send_message(peer_id, message):
+                    if node.debug_send_message(peer_id, "hello"):
                         print(f"✅ Sent message to {peer_id}")
                     else:
                         print(f"❌ Failed to send message to {peer_id}")

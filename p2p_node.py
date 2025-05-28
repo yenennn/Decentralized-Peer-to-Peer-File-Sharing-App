@@ -29,19 +29,15 @@ class P2PNode:
     """
 
     def __init__(self, local_port: int = 0, quic_port: int = 0, save_dir: str = "./downloads"):
-        """
-        Initialize the P2P node.
-
-        Args:
-            local_port: Local UDP port for peer discovery. If 0, a random port will be assigned.
-            quic_port: Local port for QUIC file transfers. If 0, a random port will be assigned.
-            save_dir: Directory to save received files
-        """
+        """Initialize the P2P node."""
         self.node_id = str(uuid.uuid4())
         self.local_port = local_port
-        self.quic_port = quic_port if quic_port != 0 else (local_port + 1000 if local_port != 0 else 4433)
+
+        # USE THE SAME PORT FOR BOTH UDP AND QUIC
+        self.quic_port = quic_port if quic_port != 0 else local_port
+
         self.save_dir = os.path.abspath(save_dir)
-        self.peers = {}  # {peer_id: {addr: (ip, port), quic_port: port, public_key: key}}
+        self.peers = {}
         self.running = False
         self.stun_client = STUNClient(local_port)
         self.crypto_manager = CryptoManager()
@@ -56,19 +52,14 @@ class P2PNode:
         self.nat_type = None
         self.external_ip = None
         self.external_port = None
-        self.external_quic_port = None
+        self.external_quic_port = None  # Will be same as external_port
 
         # QUIC event loop
         self.quic_loop = None
         self.quic_thread = None
 
     def start(self) -> Tuple[str, int, int]:
-        """
-        Start the P2P node.
-
-        Returns:
-            Tuple of (external_ip, external_port, quic_port)
-        """
+        """Start the P2P node."""
         try:
             # Discover NAT type and external IP/port using STUN
             self.nat_type, self.external_ip, self.external_port = self.stun_client.discover_nat()
@@ -88,19 +79,18 @@ class P2PNode:
             if self.local_port == 0:
                 self.local_port = actual_local_port
 
-            # Calculate QUIC port if not set
-            if self.quic_port == 4433:  # Default value
-                self.quic_port = self.local_port + 1000
+            # USE THE SAME PORT FOR QUIC
+            if self.quic_port == 0:
+                self.quic_port = self.local_port
 
-            # Calculate external QUIC port (assumption: same NAT mapping offset)
-            port_offset = self.quic_port - self.local_port
-            self.external_quic_port = self.external_port + port_offset
+            # EXTERNAL QUIC PORT IS THE SAME AS EXTERNAL UDP PORT
+            self.external_quic_port = self.external_port
 
             # Initialize QUIC-based file transfer manager
             self.file_transfer = FileTransfer(self.crypto_manager)
             self.file_transfer.receive_file(self.save_dir, self._on_transfer_progress)
 
-            # Start QUIC server in a separate thread
+            # Start QUIC server on the SAME port
             self._start_quic_server()
 
             # Start message handling thread for peer discovery
@@ -112,10 +102,8 @@ class P2PNode:
             logger.info(f"P2P node started with ID: {self.node_id}")
             logger.info(f"NAT Type: {self.nat_type}")
             logger.info(f"External IP: {self.external_ip}")
-            logger.info(f"External Port (UDP): {self.external_port}")
-            logger.info(f"External QUIC Port: {self.external_quic_port}")
-            logger.info(f"Local Port (UDP): {self.local_port}")
-            logger.info(f"Local QUIC Port: {self.quic_port}")
+            logger.info(f"External Port (UDP & QUIC): {self.external_port}")
+            logger.info(f"Local Port (UDP & QUIC): {self.local_port}")
 
             return self.external_ip, self.external_port, self.external_quic_port
 
@@ -174,31 +162,16 @@ class P2PNode:
         logger.info("P2P node stopped")
 
     def connect_to_peer(self, peer_id: str, peer_ip: str, peer_port: int, peer_quic_port: int = None) -> bool:
-        """
-        Connect to a peer using their external IP and ports.
-
-        Args:
-            peer_id: Unique identifier for the peer
-            peer_ip: External IP of the peer
-            peer_port: External UDP port of the peer (for discovery)
-            peer_quic_port: External QUIC port of the peer (for file transfer)
-
-        Returns:
-            True if connection was successful, False otherwise
-        """
+        """Connect to a peer using their external IP and port."""
         try:
             # Ensure peer_port is an integer
             if isinstance(peer_port, str):
                 peer_port = int(peer_port)
 
-            if peer_quic_port is None:
-                # Assume same offset as this node
-                port_offset = self.quic_port - self.local_port
-                peer_quic_port = peer_port + port_offset
-            elif isinstance(peer_quic_port, str):
-                peer_quic_port = int(peer_quic_port)
+            # USE THE SAME PORT FOR QUIC (ignore peer_quic_port parameter)
+            peer_quic_port = peer_port
 
-            logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_port} (QUIC: {peer_quic_port})")
+            logger.info(f"Connecting to peer {peer_id} at {peer_ip}:{peer_port} (same port for UDP & QUIC)")
 
             # Perform UDP hole punching for discovery
             if not self.stun_client.punch_hole(peer_ip, peer_port):
@@ -208,7 +181,7 @@ class P2PNode:
             # Store peer information
             self.peers[peer_id] = {
                 'addr': (peer_ip, peer_port),
-                'quic_port': peer_quic_port,
+                'quic_port': peer_quic_port,  # Same as UDP port
                 'public_key': None,
                 'connected': False,
                 'last_seen': time.time()
@@ -219,7 +192,7 @@ class P2PNode:
                 'type': 'hello',
                 'node_id': self.node_id,
                 'public_key': self.crypto_manager.get_public_key_pem().decode(),
-                'quic_port': self.external_quic_port
+                'quic_port': self.external_quic_port  # Same as external_port
             }
 
             hello_json = json.dumps(hello_msg).encode()
@@ -259,6 +232,60 @@ class P2PNode:
 
         except Exception as e:
             logger.error(f"Error connecting to peer {peer_id}: {e}")
+            return False
+
+    # Add this method to your P2PNode class for debugging
+    def debug_send_message(self, peer_id: str, message: str) -> bool:
+        """Debug version of send_message with detailed logging"""
+        print(f"\n🔍 Debug: Attempting to send message to {peer_id}")
+
+        # Check if peer exists
+        if peer_id not in self.peers:
+            print(f"❌ Peer {peer_id} not found in peers dictionary")
+            print(f"Available peers: {list(self.peers.keys())}")
+            return False
+
+        # Check connection status
+        peer = self.peers[peer_id]
+        if not peer.get('connected'):
+            print(f"❌ Peer {peer_id} is not marked as connected")
+            print(f"Peer status: {peer}")
+            return False
+
+        print(f"✅ Peer {peer_id} exists and is connected")
+        print(f"📍 Peer address: {peer['addr']}")
+
+        # Create message
+        msg = {
+            'type': 'test_message',
+            'from': self.node_id,
+            'message': message,
+            'timestamp': time.time()  # Add timestamp for debugging
+        }
+
+        print(f"📝 Message content: {msg}")
+
+        try:
+            # Check socket status
+            if not self.socket:
+                print(f"❌ Socket is None!")
+                return False
+
+            print(f"✅ Socket exists")
+
+            # Send the message
+            msg_bytes = json.dumps(msg).encode()
+            print(f"📤 Sending {len(msg_bytes)} bytes to {peer['addr']}")
+
+            result = self.socket.sendto(msg_bytes, peer['addr'])
+            print(f"✅ Socket.sendto returned: {result}")
+
+            return True
+
+        except Exception as e:
+            print(f"❌ Exception during send: {e}")
+            import traceback
+            print(f"📋 Traceback: {traceback.format_exc()}")
             return False
 
     def send_file(self, peer_id: str, file_path: str) -> Optional[str]:
