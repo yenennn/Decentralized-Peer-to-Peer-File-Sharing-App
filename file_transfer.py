@@ -87,7 +87,7 @@ class FileTransfer:
     def _kcp_upload_worker(self, transfer_id: str):
         sess = self._send_sessions[transfer_id]
         peer_addr = sess['peer_addr']
-        peer_id   = sess['peer_id']
+        peer_id = sess['peer_id']
 
         # Wait for FILE_INIT_ACK from receiver
         while not sess['init_acked']:
@@ -96,11 +96,13 @@ class FileTransfer:
         # 4) Create and configure KCP for this transfer
         conv = uuid.UUID(transfer_id).int & 0x7FFFFFFF
 
-        def _upload_output(_kcp, data: bytes):
-            self.socket.sendto(data, peer_addr)
+        # Create a KCP instance with the proper callback pattern
+        def output_callback(data: bytes, size: int, _context=None):
+            self.socket.sendto(data[:size], peer_addr)
+            return size
 
-        kcp = KCP(conv)
-        kcp.output = _upload_output
+        # Create KCP with output callback
+        kcp = KCP(conv, output_callback)
         sess['kcp'] = kcp
 
         # 5) Stream encrypted file data over KCP
@@ -113,14 +115,14 @@ class FileTransfer:
                     break
                 data = self.crypto.encrypt_data(peer_id, chunk)
                 kcp.send(data)
-                kcp.flush()
+                kcp.update(int(time.time() * 1000))
                 sent += len(chunk)
                 sess['progress_cb'](transfer_id, sent, total)
                 time.sleep(0.01)
 
         # 6) Allow final KCP packets to flush
         for _ in range(20):
-            kcp.flush()
+            kcp.update(int(time.time() * 1000))
             time.sleep(0.05)
 
         # 7) Signal end of transfer
@@ -159,8 +161,8 @@ class FileTransfer:
     def _handle_file_init(self, msg: Dict, addr: Tuple[str, int], peer_id: str):
         """Initialize receive side and reply with FILE_INIT_ACK."""
         transfer_id = msg['transfer_id']
-        file_name   = msg['file_name']
-        file_size   = msg['file_size']
+        file_name = msg['file_name']
+        file_size = msg['file_size']
 
         # Send acknowledgment
         ack = {'type': FILE_INIT_ACK, 'transfer_id': transfer_id}
@@ -173,11 +175,13 @@ class FileTransfer:
         # Create KCP for this transfer
         conv = uuid.UUID(transfer_id).int & 0x7FFFFFFF
 
-        def _recv_output(_kcp, data: bytes):
-            self.socket.sendto(data, addr)
+        # Create a KCP instance with the proper callback pattern
+        def output_callback(data: bytes, size: int, _context=None):
+            self.socket.sendto(data[:size], addr)
+            return size
 
-        kcp = KCP(conv)
-        kcp.output = _recv_output
+        # Create KCP with output callback
+        kcp = KCP(conv, output_callback)
 
         # Store session
         self._recv_sessions[transfer_id] = {
