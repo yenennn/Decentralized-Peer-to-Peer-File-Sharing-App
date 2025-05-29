@@ -84,29 +84,20 @@ class P2PGUI:
         copy_button.pack(side=tk.LEFT)
 
         # --- Connect to Peer ---
-        # --- Connect to Peer ---
         connect_frame = ttk.LabelFrame(main_frame, text="Connect to Peer", padding="10")
         connect_frame.pack(fill=tk.X, pady=5)
 
-        # Add connection string entry for pasting
-        ttk.Label(connect_frame, text="Paste Connection String:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        # Connection string entry with paste functionality
+        ttk.Label(connect_frame, text="Paste Connection String:").pack(side=tk.LEFT, padx=5)
         self.connection_entry = ttk.Entry(connect_frame, width=50)
-        self.connection_entry.grid(row=0, column=1, columnspan=2, padx=5, pady=5, sticky=tk.EW)
+        self.connection_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         self.connection_entry.insert(0, "connect <peer_id> <peer_ip> <peer_port>")
 
-        # Quick connect button
-        self.quick_connect_button = ttk.Button(connect_frame, text="Quick Connect",
+        # Connect button
+        self.quick_connect_button = ttk.Button(connect_frame, text="Connect",
                                                command=self.quick_connect_peer,
                                                state=tk.DISABLED)
-        self.quick_connect_button.grid(row=0, column=3, padx=5, pady=5)
-
-        # Separator between quick connect and manual options
-        ttk.Separator(connect_frame, orient=tk.HORIZONTAL).grid(row=1, column=0, columnspan=4,
-                                                                sticky=tk.EW, pady=10)
-
-
-
-        connect_frame.columnconfigure(1, weight=1)
+        self.quick_connect_button.pack(side=tk.LEFT, padx=5)
 
         # --- Paned Window for Peers and Actions ---
         paned_window = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
@@ -186,8 +177,7 @@ class P2PGUI:
             self.start_node_button.config(state=tk.DISABLED)
             self.port_entry.config(state=tk.DISABLED)
             self.save_dir_entry.config(state=tk.DISABLED)
-            self.connect_button.config(state=tk.NORMAL)
-            self.quick_connect_button.config(state=tk.NORMAL)  # Enable quick connect button
+            self.quick_connect_button.config(state=tk.NORMAL)  # Enable connect button
             self.log("P2P Node started successfully.")
             self.log(f"Node ID: {self.node.node_id}")
             self.log(f"External: {self.node.external_ip}:{self.node.external_port}, NAT: {self.node.nat_type}")
