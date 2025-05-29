@@ -374,10 +374,33 @@ class FileTransfer:
                     ev.set()
 
     def _handle_file_end(self, msg: Dict[str, Any], addr: Tuple[str, int]):
-        # Sender thinks it’s done; reply with ACK so it can mark complete
+        # Sender thinks it's done; reply with ACK so it can mark complete
         transfer_id = msg["transfer_id"]
-        self._send_json({"type": FILE_END_ACK, "transfer_id": transfer_id}, addr)
-        logger.debug("FILE_END received for %s – ACK sent", transfer_id)
+
+        # Add verification that we have received all chunks before sending FILE_END_ACK
+        with self.lock:
+            tf = self.transfers.get(transfer_id)
+            if not tf or tf["direction"] != "in":
+                logger.warning(f"FILE_END for unknown or outbound transfer {transfer_id}")
+                return
+
+            if "chunks_received" in tf and tf["chunks_received"] >= tf["total_chunks"]:
+                # We have all chunks, close the file handle if it's open
+                if "file_handle" in tf and tf["file_handle"]:
+                    tf["file_handle"].close()
+                    tf["file_handle"] = None
+
+                tf["status"] = "completed"
+                tf["end_time"] = time.time()
+
+                # Now send the FILE_END_ACK
+                self._send_json({"type": FILE_END_ACK, "transfer_id": transfer_id}, addr)
+                logger.debug(f"FILE_END received for {transfer_id} – ACK sent")
+                logger.info(f"Completed download of {tf['file_name']} ({transfer_id})")
+            else:
+                # We're missing chunks, don't send FILE_END_ACK yet
+                logger.warning(f"FILE_END received but chunks incomplete for {transfer_id} "
+                               f"({tf.get('chunks_received', 0)}/{tf['total_chunks']})")
 
     def _handle_file_end_ack(self, msg: Dict[str, Any]):
         transfer_id = msg["transfer_id"]
