@@ -266,49 +266,75 @@ class FileTransfer:
                     "chunk_index": chunk_index,
                     "chunk_size": len(ciphertext),
                     "total_chunks": total_chunks,
-                    "checksum": checksum  # Add checksum to header
+                    "checksum": checksum
                 }
 
-                ack_event = threading.Event()
-                with self.lock:
-                    tf["ack_events"][chunk_index] = ack_event
-                    tf["current_chunk_status"] = {"acked": False, "nak": False}
-
                 # Retry loop - continues until success or max retries
-                while retries[chunk_index] < self.MAX_RETRIES:
+                chunk_success = False
+                while retries[chunk_index] < self.MAX_RETRIES and not chunk_success:
+                    ack_event = threading.Event()
+                    with self.lock:
+                        tf["ack_events"][chunk_index] = ack_event
+                        tf["current_chunk_status"] = {"acked": False, "nak": False}
+
                     # Header then binary payload
                     self._send_json(header, peer_addr)
                     self.socket.sendto(ciphertext, peer_addr)
                     logger.debug(
-                        f"Sent chunk {chunk_index + 1}/{total_chunks} for {transfer_id} (checksum: {checksum})")
+                        f"Sent chunk {chunk_index} of {transfer_id} ({len(ciphertext)} bytes)")
 
                     # Wait for ACK/NAK response
                     if ack_event.wait(self.ACK_TIMEOUT):
-                        # Check if it was a NAK or an ACK
                         with self.lock:
-                            if tf["current_chunk_status"]["nak"]:
-                                # Checksum failed at receiver, retry
+                            status = tf["current_chunk_status"]
+                            if status["acked"]:
+                                logger.debug(f"Chunk {chunk_index} ACKed")
+                                chunk_success = True
+                                break
+                            elif status["nak"]:
                                 logger.warning(f"Checksum mismatch for chunk {chunk_index} - retransmitting")
-                                tf["current_chunk_status"]["nak"] = False  # Reset NAK flag
                                 retries[chunk_index] += 1
                                 continue
-
-                            # Success - next chunk
-                            tf["chunks_sent"] += 1
-                            if tf["progress_cb"]:
-                                tf["progress_cb"](transfer_id, tf["chunks_sent"], total_chunks)
-                            break
 
                     # Timeout - retry
                     retries[chunk_index] += 1
                     logger.warning(
                         f"Resending chunk {chunk_index} (attempt {retries[chunk_index] + 1}) for {transfer_id}")
 
-                else:  # exceeded retries
+                if not chunk_success:  # exceeded retries
                     logger.error(f"Transfer {transfer_id} failed - giving up on chunk {chunk_index}")
                     with self.lock:
                         tf["status"] = "failed"
                     return
+
+                # Update progress after successful chunk
+                with self.lock:
+                    tf["chunks_sent"] = chunk_index + 1
+                    if self.progress_callback:
+                        self.progress_callback(transfer_id, chunk_index + 1, total_chunks)
+
+            # All chunks ACKed - explicitly send FILE_END
+            self._send_json({"type": FILE_END, "transfer_id": transfer_id}, peer_addr)
+            logger.debug(f"All chunks sent for {transfer_id}. Sending FILE_END")
+
+            # Wait for FILE_END_ACK
+            end_deadline = time.time() + self.ACK_TIMEOUT * self.MAX_RETRIES
+            while time.time() < end_deadline:
+                with self.lock:
+                    if tf.get("end_acked"):
+                        break
+                time.sleep(0.25)
+
+            with self.lock:
+                if tf.get("end_acked"):
+                    tf["status"] = "completed"
+                    tf["end_time"] = time.time()
+                    dur = tf["end_time"] - tf["start_time"]
+                    speed = tf["file_size"] / dur / 1024 if dur else 0
+                    logger.info("Upload of %s completed – %.2f KB/s", tf["file_name"], speed)
+                else:
+                    tf["status"] = "failed"
+                    logger.error("Transfer %s failed – no FILE_END_ACK", transfer_id)
 
         # All chunks ACKed - explicitly send FILE_END
         self._send_json({"type": FILE_END, "transfer_id": transfer_id}, peer_addr)
