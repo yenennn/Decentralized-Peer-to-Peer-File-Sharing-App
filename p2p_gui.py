@@ -200,11 +200,21 @@ class P2PGUI:
             self.ext_ip_label.config(text=f"External IP: {info['external_ip']}")
             self.ext_port_label.config(text=f"External Port: {info['external_port']}")
             self.nat_type_label.config(text=f"NAT Type: {info['nat_type']}")
+
+            # Update the connection string
+            self.connection_string.config(state="normal")
+            self.connection_string.delete(0, tk.END)
+            self.connection_string.insert(0, f"connect {info['node_id']} {info['external_ip']} {info['external_port']}")
+            self.connection_string.config(state="readonly")
         else:
             self.node_id_label.config(text="Node ID: Not available")
             self.ext_ip_label.config(text="External IP: Not available")
             self.ext_port_label.config(text="External Port: Not available")
             self.nat_type_label.config(text="NAT Type: Not available")
+            self.connection_string.config(state="normal")
+            self.connection_string.delete(0, tk.END)
+            self.connection_string.insert(0, "connect <node_id> <external_ip> <external_port>")
+            self.connection_string.config(state="readonly")
 
     def connect_peer(self):
         if not self.node:
