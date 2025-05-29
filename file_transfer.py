@@ -225,15 +225,9 @@ class FileTransfer:
             ack_msg = {"type": CHUNK_ACK, "transfer_id": transfer_id, "chunk_index": chunk_index}
             self._send_json(ack_msg, addr)
 
-            # Done?
+            # Don't send FILE_END_ACK here - wait for explicit FILE_END from sender
             if tf["chunks_received"] >= tf["total_chunks"]:
-                tf["file_handle"].close()
-                tf["status"] = "completed"
-                tf["end_time"] = time.time()
-                # Let sender know everything arrived OK
-                end_ack = {"type": FILE_END_ACK, "transfer_id": transfer_id}
-                self._send_json(end_ack, addr)
-                logger.info(f"Completed download of {tf['file_name']} ({transfer_id})")
+                logger.debug(f"All chunks received for {transfer_id}. Waiting for FILE_END")
     # ---------------------------------------------------------------------
     # Internal helpers
     # ---------------------------------------------------------------------
@@ -316,8 +310,9 @@ class FileTransfer:
                         tf["status"] = "failed"
                     return
 
-        # All chunks ACKed - send FILE_END
+        # All chunks ACKed - explicitly send FILE_END
         self._send_json({"type": FILE_END, "transfer_id": transfer_id}, peer_addr)
+        logger.debug(f"All chunks sent for {transfer_id}. Sending FILE_END")
 
         # Wait for FILE_END_ACK
         end_deadline = time.time() + self.ACK_TIMEOUT * self.MAX_RETRIES
@@ -333,11 +328,10 @@ class FileTransfer:
                 tf["end_time"] = time.time()
                 dur = tf["end_time"] - tf["start_time"]
                 speed = tf["file_size"] / dur / 1024 if dur else 0
-                logger.info("Upload of %s completed – %.2f KB/s", tf["file_name"], speed)
+                logger.info("Upload of %s completed – %.2f KB/s", tf["file_name"], speed)
             else:
                 tf["status"] = "failed"
                 logger.error("Transfer %s failed – no FILE_END_ACK", transfer_id)
-
     # ------------------------- inbound JSON handlers ------------------------
     def _handle_file_init(self, msg: Dict[str, Any], addr: Tuple[str, int], peer_id: str):
         transfer_id = msg["transfer_id"]
