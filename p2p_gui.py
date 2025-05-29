@@ -445,18 +445,8 @@ class P2PGUI:
             messagebox.showerror("Error", "Peer port must be a number.")
             return
 
-        # Fill the manual fields (for user reference)
-        self.peer_id_entry.delete(0, tk.END)
-        self.peer_id_entry.insert(0, peer_id)
-
-        self.peer_ip_entry.delete(0, tk.END)
-        self.peer_ip_entry.insert(0, peer_ip)
-
-        self.peer_port_entry.delete(0, tk.END)
-        self.peer_port_entry.insert(0, peer_port_str)
-
         # Start connection
-        self.log(f"Quick connecting to {peer_id} at {peer_ip}:{peer_port}...")
+        self.log(f"Connecting to {peer_id} at {peer_ip}:{peer_port}...")
 
         if self.node.connect_to_peer(peer_id, peer_ip, peer_port):
             self.log(f"Connection attempt to {peer_id} initiated. Check peer list for status.")
