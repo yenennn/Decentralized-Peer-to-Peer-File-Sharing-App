@@ -25,6 +25,7 @@ present in the user’s skeleton).
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
@@ -45,6 +46,7 @@ FILE_CHUNK = "file_chunk"          # JSON header (no binary payload)
 CHUNK_ACK = "chunk_ack"
 FILE_END = "file_end"
 FILE_END_ACK = "file_end_ack"
+CHUNK_NAK = "chunk_nak"
 
 
 class FileTransfer:
@@ -122,7 +124,7 @@ class FileTransfer:
         try:
             msg = json.loads(data.decode())
         except Exception:
-            logger.debug("handle_message: not JSON – ignoring")
+            logger.debug("handle_message: not JSON - ignoring")
             return
 
         mtype = msg.get("type")
@@ -132,6 +134,8 @@ class FileTransfer:
             self._handle_file_init_ack(msg)
         elif mtype == CHUNK_ACK:
             self._handle_chunk_ack(msg)
+        elif mtype == CHUNK_NAK:  # Add handler for NAK messages
+            self._handle_chunk_nak(msg)
         elif mtype == FILE_END:
             self._handle_file_end(msg, addr)
         elif mtype == FILE_END_ACK:
@@ -153,11 +157,24 @@ class FileTransfer:
         with self.lock:
             tf = self.transfers.get(transfer_id)
             if not tf:
-                logger.warning("Chunk header for unknown transfer %s", transfer_id)
+                logger.warning(f"Chunk header for unknown transfer {transfer_id}")
                 return
-            tf["expected_chunk_index"] = chunk_index  # for bookkeeping only
+            tf["expected_chunk_index"] = chunk_index
             tf["expected_chunk_size"] = header["chunk_size"]
+            tf["expected_checksum"] = header.get("checksum", "")  # Store expected checksum
             # actual data arrives via _process_chunk()
+
+    def _handle_chunk_nak(self, msg: Dict[str, Any]):
+        """Handle negative acknowledgment for a chunk with bad checksum."""
+        transfer_id = msg["transfer_id"]
+        chunk_index = msg["chunk_index"]
+        with self.lock:
+            tf = self.transfers.get(transfer_id)
+            if tf and tf["direction"] == "out":
+                ev = tf["ack_events"].get(chunk_index)
+                if ev and not ev.is_set():
+                    tf["current_chunk_status"]["nak"] = True
+                    ev.set()
 
     def _process_chunk(self, transfer_id: str, chunk_index: int, peer_id: str,
                        addr: Tuple[str, int], data: bytes):
@@ -165,17 +182,32 @@ class FileTransfer:
         with self.lock:
             tf = self.transfers.get(transfer_id)
             if not tf or tf["direction"] != "in":
-                logger.warning("Data chunk for unknown or outbound transfer %s", transfer_id)
+                logger.warning(f"Data chunk for unknown or outbound transfer {transfer_id}")
+                return
+
+            # Verify checksum
+            received_checksum = hashlib.md5(data).hexdigest()
+            expected_checksum = tf.get("expected_checksum", "")
+
+            if received_checksum != expected_checksum:
+                # Checksum mismatch - send NAK
+                logger.warning(f"Checksum mismatch for chunk {chunk_index} (transfer {transfer_id})")
+                nak_msg = {
+                    "type": CHUNK_NAK,
+                    "transfer_id": transfer_id,
+                    "chunk_index": chunk_index
+                }
+                self._send_json(nak_msg, addr)
                 return
 
             try:
                 plaintext = self._decrypt(peer_id, data)
             except Exception as exc:
-                logger.error("Decryption failed – aborting transfer %s: %s", transfer_id, exc)
+                logger.error(f"Decryption failed - aborting transfer {transfer_id}: {exc}")
                 tf["status"] = "failed"
                 return
 
-            # Lazy‑open file handle on first chunk
+            # Lazy-open file handle on first chunk
             if "file_handle" not in tf:
                 dest = self.save_dir / tf["file_name"]
                 tf["dest_path"] = dest
@@ -189,7 +221,7 @@ class FileTransfer:
             if self.progress_callback:
                 self.progress_callback(transfer_id, tf["chunks_received"], tf["total_chunks"])
 
-            # ACK back to sender -------------------------------------------------
+            # ACK back to sender
             ack_msg = {"type": CHUNK_ACK, "transfer_id": transfer_id, "chunk_index": chunk_index}
             self._send_json(ack_msg, addr)
 
@@ -201,8 +233,7 @@ class FileTransfer:
                 # Let sender know everything arrived OK
                 end_ack = {"type": FILE_END_ACK, "transfer_id": transfer_id}
                 self._send_json(end_ack, addr)
-                logger.info("Completed download of %s (%s)", tf["file_name"], transfer_id)
-
+                logger.info(f"Completed download of {tf['file_name']} ({transfer_id})")
     # ---------------------------------------------------------------------
     # Internal helpers
     # ---------------------------------------------------------------------
@@ -215,7 +246,7 @@ class FileTransfer:
         total_chunks = tf["total_chunks"]
         retries: Dict[int, int] = {i: 0 for i in range(total_chunks)}
 
-        # Wait for FILE_INIT_ACK before flooding chunks (gives receiver time)
+        # Wait for FILE_INIT_ACK before sending chunks
         while True:
             with self.lock:
                 if tf.get("init_acked") or tf["status"] == "failed":
@@ -225,16 +256,15 @@ class FileTransfer:
         if tf["status"] == "failed":
             return
 
-        # Send chunks sequentially (simple, reliable, NAT‑friendly) ----------
+        # Send chunks sequentially with checksum verification
         with open(path, "rb") as fh:
             for chunk_index in range(total_chunks):
-                ack_event = threading.Event()
-                with self.lock:
-                    tf["ack_events"][chunk_index] = ack_event
-
                 # Read & (optionally) encrypt
                 data = fh.read(self.DEFAULT_CHUNK_SIZE)
                 ciphertext = self._encrypt(tf["peer_id"], data)
+
+                # Calculate checksum of encrypted data
+                checksum = hashlib.md5(ciphertext).hexdigest()
 
                 header = {
                     "type": FILE_CHUNK,
@@ -242,33 +272,51 @@ class FileTransfer:
                     "chunk_index": chunk_index,
                     "chunk_size": len(ciphertext),
                     "total_chunks": total_chunks,
+                    "checksum": checksum  # Add checksum to header
                 }
 
-                # Retry loop --------------------------------------------------
+                ack_event = threading.Event()
+                with self.lock:
+                    tf["ack_events"][chunk_index] = ack_event
+                    tf["current_chunk_status"] = {"acked": False, "nak": False}
+
+                # Retry loop - continues until success or max retries
                 while retries[chunk_index] < self.MAX_RETRIES:
                     # Header then binary payload
                     self._send_json(header, peer_addr)
                     self.socket.sendto(ciphertext, peer_addr)
-                    logger.debug("Sent chunk %s/%s for %s", chunk_index+1, total_chunks, transfer_id)
+                    logger.debug(
+                        f"Sent chunk {chunk_index + 1}/{total_chunks} for {transfer_id} (checksum: {checksum})")
 
+                    # Wait for ACK/NAK response
                     if ack_event.wait(self.ACK_TIMEOUT):
-                        # Success – next chunk
+                        # Check if it was a NAK or an ACK
                         with self.lock:
+                            if tf["current_chunk_status"]["nak"]:
+                                # Checksum failed at receiver, retry
+                                logger.warning(f"Checksum mismatch for chunk {chunk_index} - retransmitting")
+                                tf["current_chunk_status"]["nak"] = False  # Reset NAK flag
+                                retries[chunk_index] += 1
+                                continue
+
+                            # Success - next chunk
                             tf["chunks_sent"] += 1
                             if tf["progress_cb"]:
                                 tf["progress_cb"](transfer_id, tf["chunks_sent"], total_chunks)
-                        break
+                            break
 
+                    # Timeout - retry
                     retries[chunk_index] += 1
-                    logger.warning("Resending chunk %s (attempt %s) for %s", chunk_index, retries[chunk_index]+1, transfer_id)
+                    logger.warning(
+                        f"Resending chunk {chunk_index} (attempt {retries[chunk_index] + 1}) for {transfer_id}")
 
                 else:  # exceeded retries
-                    logger.error("Transfer %s failed – giving up on chunk %s", transfer_id, chunk_index)
+                    logger.error(f"Transfer {transfer_id} failed - giving up on chunk {chunk_index}")
                     with self.lock:
                         tf["status"] = "failed"
                     return
 
-        # All chunks ACKed – send FILE_END -----------------------------------
+        # All chunks ACKed - send FILE_END
         self._send_json({"type": FILE_END, "transfer_id": transfer_id}, peer_addr)
 
         # Wait for FILE_END_ACK
