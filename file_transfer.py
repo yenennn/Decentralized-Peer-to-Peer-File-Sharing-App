@@ -230,14 +230,14 @@ class FileTransfer:
         total_chunks = tf["total_chunks"]
         last_progress_update = time.time()
 
-        # Modified transmission loop - only send one chunk at a time
+        # Main transmission loop
         while not window.is_complete(total_chunks):
             with self.lock:
                 if tf["status"] == "failed":
                     break
 
-            # Send only one new packet if window allows
-            if window.can_send() and window.next_seq < total_chunks:
+            # Send new packets if window allows
+            while window.can_send() and window.next_seq < total_chunks:
                 chunk_index = window.next_seq
                 self._send_chunk(transfer_id, chunk_index, tf["chunk_data"][chunk_index])
                 window.mark_sent(chunk_index)
@@ -245,21 +245,35 @@ class FileTransfer:
                 with self.lock:
                     tf["chunks_sent"] = max(tf["chunks_sent"], chunk_index + 1)
 
-                # Wait for ACK before sending next chunk
-                ack_received = False
-                wait_start = time.time()
-                while time.time() - wait_start < self.ACK_TIMEOUT:
-                    with self.lock:
-                        if chunk_index in window.acked or tf["status"] == "failed":
-                            ack_received = True
-                            break
-                    time.sleep(0.01)
+            # Handle retransmissions
+            to_retransmit = window.get_unacked_packets(self.ACK_TIMEOUT, self.MAX_RETRIES)
+            for chunk_index in to_retransmit:
+                if chunk_index < total_chunks:
+                    logger.warning(f"Retransmitting chunk {chunk_index} for {transfer_id}")
+                    self._send_chunk(transfer_id, chunk_index, tf["chunk_data"][chunk_index])
+                    window.increment_retry(chunk_index)
+                    window.sent_time[chunk_index] = time.time()
 
-                if not ack_received:
-                    logger.warning(f"No ACK received for chunk {chunk_index}, will retry")
-                    # Let the retransmission logic handle it
+            # Update progress periodically
+            now = time.time()
+            if now - last_progress_update > 1.0:
+                with self.lock:
+                    if tf["progress_cb"]:
+                        acked_count = len([i for i in range(window.base) if i < total_chunks])
+                        tf["progress_cb"](transfer_id, acked_count, total_chunks)
+                last_progress_update = now
 
-            # Rest of the original code for retransmissions...
+            # Check for failed retransmissions
+            failed_chunks = [
+                seq for seq, count in window.retry_count.items()
+                if count >= self.MAX_RETRIES and seq not in window.acked
+            ]
+            if failed_chunks:
+                logger.error(f"Transfer {transfer_id} failed - too many retries for chunks: {failed_chunks}")
+                with self.lock:
+                    tf["status"] = "failed"
+                break
+
             time.sleep(0.01)  # Small delay to prevent busy waiting
 
         # Send completion signal
@@ -327,9 +341,6 @@ class FileTransfer:
             self._handle_file_end(msg, addr)
         elif mtype == FILE_END_ACK:
             self._handle_file_end_ack(msg)
-        elif mtype == FILE_CHUNK:
-            # Add this missing case to handle chunk headers
-            self._handle_file_chunk(msg, addr, peer_id)
 
     def _handle_file_init_enhanced(self, msg: Dict[str, Any], addr: Tuple[str, int], peer_id: str):
         """Enhanced file init handler with receive buffer setup"""
@@ -415,7 +426,7 @@ class FileTransfer:
             tf["expected_chunk_size"] = header["chunk_size"]
 
     def _process_chunk_enhanced(self, transfer_id: str, chunk_index: int, peer_id: str,
-                                addr: Tuple[str, int], data: bytes):
+                              addr: Tuple[str, int], data: bytes):
         """Enhanced chunk processing with reordering"""
         with self.lock:
             tf = self.transfers.get(transfer_id)
@@ -438,18 +449,11 @@ class FileTransfer:
             if "file_handle" not in tf:
                 dest = self.save_dir / tf["file_name"]
                 tf["dest_path"] = dest
-                try:
-                    # Make sure to open in binary write mode
-                    tf["file_handle"] = open(dest, "wb")
-                except Exception as e:
-                    logger.error(f"Failed to open file {dest}: {e}")
-                    tf["status"] = "failed"
-                    return
+                tf["file_handle"] = dest.open("wb")
 
             # Write contiguous chunks to file
             contiguous_chunks = receive_buffer.get_contiguous_chunks()
             for idx, chunk_data in contiguous_chunks:
-                # Make sure we're only writing actual file data, not headers
                 tf["file_handle"].write(chunk_data)
                 tf["file_handle"].flush()
                 tf["chunks_received"] += 1
@@ -460,7 +464,9 @@ class FileTransfer:
 
             # Periodically send window acknowledgment
             now = time.time()
-            if now - tf.get('last_window_ack_time', 0) > self.WINDOW_ACK_INTERVAL:
+            if (hasattr(tf, 'last_window_ack_time') and
+                now - tf.get('last_window_ack_time', 0) > self.WINDOW_ACK_INTERVAL):
+
                 # Send comprehensive window status
                 received_chunks = list(receive_buffer.received_set)
                 missing_chunks = receive_buffer.get_missing_chunks(max(received_chunks) if received_chunks else 0)
@@ -534,30 +540,9 @@ class FileTransfer:
             return self.crypto.decrypt_data(peer_id, ciphertext)
         return ciphertext
 
-    def handle_binary_data(self, data: bytes, addr: Tuple[str, int], peer_id: str):
-        """Process binary data (actual chunk content)"""
-        with self.lock:
-            # Find which transfer is expecting data from this peer
-            for transfer_id, tf in self.transfers.items():
-                if (tf["direction"] == "in" and
-                        tf["peer_addr"] == addr and
-                        "expected_chunk_index" in tf):
-
-                    # Get expected chunk information
-                    chunk_index = tf.pop("expected_chunk_index")
-                    expected_size = tf.pop("expected_chunk_size", len(data))
-
-                    # Verify chunk size
-                    if len(data) != expected_size:
-                        logger.warning(
-                            f"Chunk size mismatch for {transfer_id}: expected {expected_size}, got {len(data)}")
-                        return
-
-                    # Process this chunk (only the binary data, not header)
-                    self._process_chunk(transfer_id, chunk_index, peer_id, addr, data)
-                    return
-
-            logger.debug(f"Received unexpected binary data from {addr} – dropping")
+    def handle_binary_data(self, *_):
+        """Binary datagrams that arrive outside the expected flow are ignored."""
+        logger.debug("Received stray binary data – dropping")
 
     # Add method for processing chunks (called by P2PNode)
     def _process_chunk(self, transfer_id: str, chunk_index: int, peer_id: str,
