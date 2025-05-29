@@ -20,18 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Public services that support QUIC (HTTP/3)
 QUIC_DISCOVERY_SERVICES = [
-('stun.l.google.com', 19302),
-    ('stun1.l.google.com', 19302),
-    ('stun2.l.google.com', 19302),
-    ('stun.ekiga.net', 3478),
-    ('stun.ideasip.com', 3478),
-    ('stun.schlund.de', 3478),
-    ('stun.stunprotocol.org', 3478),
-    ('stun.voiparound.com', 3478),
-    ('stun.voipbuster.com', 3478),
-    ('stun.voipstunt.com', 3478),
-    ('stun.voxgratia.org', 3478),
-    ('stun.l.google.com', 443),  # Use HTTPS/HTTP3 ports for QUIC
+('stun.l.google.com', 443),  # Use HTTPS/HTTP3 ports for QUIC
     ('cloudflare-quic.com', 443),
     ('google.com', 443),
     ('facebook.com', 443),
