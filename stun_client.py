@@ -29,7 +29,6 @@ STUN_SERVERS = [
     ('stun.voxgratia.org', 3478)
 ]
 
-
 class NATType:
     """NAT type constants"""
     UNKNOWN = "Unknown"
@@ -39,7 +38,6 @@ class NATType:
     PORT_RESTRICTED_CONE = "Port Restricted Cone"
     SYMMETRIC = "Symmetric"
     BLOCKED = "Blocked"
-
 
 class STUNClient:
     """Client for STUN server communication and NAT traversal"""
@@ -110,14 +108,14 @@ class STUNClient:
                     # Skip the 20-byte header
                     pos = 20
                     while pos + 4 <= len(data):
-                        attr_type = struct.unpack('>H', data[pos:pos + 2])[0]
-                        attr_len = struct.unpack('>H', data[pos + 2:pos + 4])[0]
+                        attr_type = struct.unpack('>H', data[pos:pos+2])[0]
+                        attr_len = struct.unpack('>H', data[pos+2:pos+4])[0]
 
                         if attr_type == 0x0020:  # XOR-MAPPED-ADDRESS
                             if attr_len >= 8:  # IPv4 address
                                 # Skip the first 4 bytes (family and port)
-                                xor_port = struct.unpack('>H', data[pos + 6:pos + 8])[0] ^ (0x2112A442 >> 16)
-                                xor_ip = struct.unpack('>I', data[pos + 8:pos + 12])[0] ^ 0x2112A442
+                                xor_port = struct.unpack('>H', data[pos+6:pos+8])[0] ^ (0x2112A442 >> 16)
+                                xor_ip = struct.unpack('>I', data[pos+8:pos+12])[0] ^ 0x2112A442
                                 ip = socket.inet_ntoa(struct.pack('>I', xor_ip))
 
                                 self.external_ip = ip
@@ -196,7 +194,7 @@ class STUNClient:
             try:
                 # Send a hole punching message
                 self.socket.sendto(b"HOLE_PUNCHING", (peer_ip, peer_port))
-                logger.info(f"Sent hole punching packet {i + 1}/{attempts}")
+                logger.info(f"Sent hole punching packet {i+1}/{attempts}")
                 time.sleep(0.5)  # Short delay between attempts
             except Exception as e:
                 logger.error(f"Error during hole punching: {e}")

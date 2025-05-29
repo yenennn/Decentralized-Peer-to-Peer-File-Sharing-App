@@ -16,7 +16,6 @@ from p2p_node import P2PNode
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
 def print_banner():
     """Print a banner for the demo"""
     print("\n" + "=" * 80)
@@ -25,7 +24,6 @@ def print_banner():
     print("This demo shows how to use the P2P file sharing system to share files between peers.")
     print("Each peer uses STUN for NAT traversal and UDP hole punching for direct connections.")
     print("Files are encrypted with AES and transferred directly between peers.\n")
-
 
 def print_peer_info(node: P2PNode):
     """Print information about the peer"""
@@ -38,7 +36,6 @@ def print_peer_info(node: P2PNode):
     print("\nShare this information with other peers to connect.")
     print("=" * 80 + "\n")
 
-
 def print_help():
     """Print help information"""
     print("\nCommands:")
@@ -50,7 +47,6 @@ def print_help():
     print("  info - Show your peer information")
     print("  help - Show this help message")
     print("  exit - Exit the demo")
-
 
 def monitor_transfer(node: P2PNode, transfer_id: str):
     """Monitor a file transfer and print updates"""
@@ -71,7 +67,6 @@ def monitor_transfer(node: P2PNode, transfer_id: str):
 
         time.sleep(1)
 
-
 def main():
     """Main function for the demo"""
     parser = argparse.ArgumentParser(description='P2P File Sharing Demo')
@@ -91,7 +86,6 @@ def main():
             if msg is not None:
                 print(f"\n[Message from {msg['peer_id']}]: {msg['message']}")
             time.sleep(0.2)
-
     threading.Thread(target=print_incoming_messages, daemon=True).start()
 
     try:
@@ -224,7 +218,6 @@ def main():
         # Stop the P2P node
         node.stop()
         print("\nP2P node stopped. Goodbye!")
-
 
 if __name__ == "__main__":
     main()
