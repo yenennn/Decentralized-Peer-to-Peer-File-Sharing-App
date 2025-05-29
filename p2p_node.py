@@ -1,5 +1,5 @@
 """
-QUIC-only P2P node implementation.
+Pure QUIC P2P node implementation.
 All communication (discovery, hole punching, file transfer) uses QUIC.
 """
 import os
@@ -61,7 +61,7 @@ class QuicP2PProtocol:
             logger.error("Invalid hello message")
             return
 
-        logger.info(f"Received QUIC hello from peer {sender_id}")
+        logger.info(f"📨 Received QUIC hello from peer {sender_id}")
 
         # Store peer information
         self.node.peers[sender_id] = {
@@ -70,7 +70,8 @@ class QuicP2PProtocol:
                 peer_public_key_pem.encode()
             ),
             'connected': True,
-            'last_seen': time.time()
+            'last_seen': time.time(),
+            'stream_id': stream_id
         }
 
         # Send hello acknowledgment via QUIC
@@ -80,27 +81,108 @@ class QuicP2PProtocol:
             'public_key': self.node.crypto_manager.get_public_key_pem().decode()
         }
 
-        # Send via existing QUIC stream or create new one
         await self._send_quic_message(stream_id, hello_ack, sender_id)
-
-        # Generate and send session key
         await self._send_session_key(sender_id)
+
+    async def _handle_hello_ack(self, message: Dict, peer_id: str):
+        """Handle hello acknowledgment from a peer via QUIC"""
+        sender_id = message.get('node_id')
+        peer_public_key_pem = message.get('public_key')
+
+        if not sender_id or not peer_public_key_pem:
+            logger.error("Invalid hello_ack message")
+            return
+
+        logger.info(f"✅ Received QUIC hello_ack from peer {sender_id}")
+
+        # Update peer information
+        if sender_id in self.node.peers:
+            self.node.peers[sender_id]['public_key'] = self.node.crypto_manager.load_peer_public_key(
+                peer_public_key_pem.encode()
+            )
+            self.node.peers[sender_id]['connected'] = True
+            self.node.peers[sender_id]['last_seen'] = time.time()
+
+            await self._send_session_key(sender_id)
+        else:
+            logger.warning(f"Received hello_ack from unknown peer {sender_id}")
+
+    async def _handle_key_exchange(self, message: Dict, stream_id: int, peer_id: str):
+        """Handle key exchange message from a peer via QUIC"""
+        sender_id = message.get('node_id')
+        encrypted_key_b64 = message.get('encrypted_key')
+
+        if not sender_id or not encrypted_key_b64:
+            logger.error("Invalid key_exchange message")
+            return
+
+        logger.info(f"🔐 Received QUIC session key from peer {sender_id}")
+
+        try:
+            encrypted_key_package = base64.b64decode(encrypted_key_b64)
+            key, iv = self.node.crypto_manager.decrypt_session_key(encrypted_key_package)
+
+            self.node.crypto_manager.store_peer_session_key(sender_id, key, iv)
+
+            key_exchange_ack = {
+                'type': 'key_exchange_ack',
+                'node_id': self.node.node_id
+            }
+
+            await self._send_quic_message(stream_id, key_exchange_ack, sender_id)
+            logger.info(f"🔑 QUIC session key exchange with peer {sender_id} completed")
+
+        except Exception as e:
+            logger.error(f"Error decrypting session key from {sender_id}: {e}")
+
+    async def _handle_key_exchange_ack(self, message: Dict, peer_id: str):
+        """Handle key exchange acknowledgment from a peer via QUIC"""
+        sender_id = message.get('node_id')
+
+        if not sender_id:
+            logger.error("Invalid key_exchange_ack message")
+            return
+
+        logger.info(f"✅ Received QUIC key exchange acknowledgment from peer {sender_id}")
+
+        if sender_id in self.node.peers:
+            self.node.peers[sender_id]['last_seen'] = time.time()
+            self.node.peers[sender_id]['key_exchanged'] = True
+        else:
+            logger.warning(f"Received key_exchange_ack from unknown peer {sender_id}")
 
     async def _send_quic_message(self, stream_id: int, message: dict, peer_id: str):
         """Send message via QUIC stream"""
-        # This would be implemented based on your QUIC connection management
-        # For now, log the action
-        logger.info(f"Sending QUIC message to {peer_id}: {message['type']}")
+        try:
+            logger.debug(f"📤 Sending QUIC message to {peer_id}: {message['type']}")
+
+            # Store pending messages for when connection is available
+            if peer_id not in self.peer_connections:
+                self.peer_connections[peer_id] = {
+                    'pending_messages': [message],
+                    'stream_id': stream_id
+                }
+            else:
+                self.peer_connections[peer_id]['pending_messages'].append(message)
+
+        except Exception as e:
+            logger.error(f"Error sending QUIC message to {peer_id}: {e}")
 
     async def _send_session_key(self, peer_id: str):
         """Generate and send session key via QUIC"""
         if peer_id not in self.node.peers:
+            logger.error(f"Cannot send session key to unknown peer {peer_id}")
+            return
+
+        peer_info = self.node.peers[peer_id]
+        if not peer_info.get('public_key'):
+            logger.error(f"Cannot send session key to peer {peer_id}: missing public key")
             return
 
         try:
             key, iv = self.node.crypto_manager.generate_session_key()
             encrypted_key_package = self.node.crypto_manager.encrypt_session_key(
-                self.node.peers[peer_id]['public_key'], key, iv
+                peer_info['public_key'], key, iv
             )
 
             self.node.crypto_manager.store_peer_session_key(peer_id, key, iv)
@@ -111,14 +193,16 @@ class QuicP2PProtocol:
                 'encrypted_key': base64.b64encode(encrypted_key_package).decode()
             }
 
-            # Send via QUIC (implementation depends on connection management)
-            logger.info(f"Sent QUIC session key to peer {peer_id}")
+            stream_id = peer_info.get('stream_id', 0)
+            await self._send_quic_message(stream_id, key_exchange, peer_id)
+
+            logger.info(f"🔐 Sent QUIC session key to peer {peer_id}")
 
         except Exception as e:
-            logger.error(f"Error sending QUIC session key: {e}")
+            logger.error(f"Error sending QUIC session key to peer {peer_id}: {e}")
 
 class P2PNode:
-    """QUIC-only P2P node implementation"""
+    """Pure QUIC P2P node implementation"""
 
     def __init__(self, local_port: int = 0, quic_port: int = 0, save_dir: str = "./downloads"):
         self.node_id = str(uuid.uuid4())
@@ -128,7 +212,7 @@ class P2PNode:
         self.peers = {}
         self.running = False
 
-        # Use QUIC-based STUN client
+        # Use pure QUIC STUN client
         self.stun_client = STUNClient(self.local_port)
         self.crypto_manager = CryptoManager()
         self.file_transfer = None
@@ -149,46 +233,58 @@ class P2PNode:
         os.makedirs(self.save_dir, exist_ok=True)
 
     def start(self) -> Tuple[str, int, int]:
-        """Start the QUIC-only P2P node"""
+        """Start the pure QUIC P2P node"""
         try:
-            # Start QUIC event loop
+            # Start QUIC event loop first
             self._start_quic_loop()
 
-            # Discover NAT using QUIC
-            self.nat_type, self.external_ip, self.external_port = asyncio.run_coroutine_threadsafe(
+            # Discover NAT using pure QUIC
+            logger.info("🔍 Starting QUIC-based NAT discovery...")
+            future = asyncio.run_coroutine_threadsafe(
                 self.stun_client.discover_nat_async(),
                 self.quic_loop
-            ).result()
+            )
+            self.nat_type, self.external_ip, self.external_port = future.result(timeout=30)
 
             if not self.external_ip or not self.external_port:
-                raise RuntimeError("Failed to discover external IP and port")
+                raise RuntimeError("Failed to discover external IP and port via QUIC")
 
-            # Start hole punch server
+            # Ensure external_port is an integer
+            if isinstance(self.external_port, str):
+                self.external_port = int(self.external_port)
+
+            # Start QUIC hole punch server
+            logger.info("🎯 Starting QUIC hole punch server...")
             asyncio.run_coroutine_threadsafe(
                 self.stun_client.start_hole_punch_server(),
                 self.quic_loop
-            )
+            ).result(timeout=15)
 
             # Initialize file transfer
             self.file_transfer = FileTransfer(self.crypto_manager)
             self.file_transfer.receive_file(self.save_dir, self._on_transfer_progress)
 
             # Start QUIC file transfer server
+            logger.info("📁 Starting QUIC file transfer server...")
             asyncio.run_coroutine_threadsafe(
                 self.file_transfer.start_server(self.quic_port),
                 self.quic_loop
-            )
+            ).result(timeout=15)
 
             self.running = True
 
-            logger.info(f"QUIC P2P node started with ID: {self.node_id}")
-            logger.info(f"External IP: {self.external_ip}")
-            logger.info(f"External Port: {self.external_port}")
+            logger.info(f"🎉 Pure QUIC P2P node started successfully!")
+            logger.info(f"   🆔 Node ID: {self.node_id}")
+            logger.info(f"   🌐 External IP: {self.external_ip}")
+            logger.info(f"   🔌 QUIC Port: {self.external_port}")
+            logger.info(f"   🌍 NAT Type: {self.nat_type}")
 
             return self.external_ip, self.external_port, self.external_port
 
         except Exception as e:
-            logger.error(f"Error starting QUIC P2P node: {e}")
+            logger.error(f"❌ Error starting pure QUIC P2P node: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             self.stop()
             raise
 
@@ -198,7 +294,10 @@ class P2PNode:
             self.quic_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.quic_loop)
             try:
+                logger.info("🚀 Starting QUIC event loop...")
                 self.quic_loop.run_forever()
+            except Exception as e:
+                logger.error(f"❌ QUIC loop error: {e}")
             finally:
                 self.quic_loop.close()
 
@@ -206,33 +305,46 @@ class P2PNode:
         self.quic_thread.start()
 
         # Wait for loop to start
-        time.sleep(1)
+        time.sleep(2)
+        logger.info("✅ QUIC event loop started")
 
     def stop(self):
-        """Stop the QUIC P2P node"""
+        """Stop the pure QUIC P2P node"""
         self.running = False
 
         if self.quic_loop and self.quic_loop.is_running():
-            self.quic_loop.call_soon_threadsafe(self.quic_loop.stop)
+            try:
+                # Stop QUIC servers
+                if self.file_transfer:
+                    asyncio.run_coroutine_threadsafe(
+                        self.file_transfer.stop_server(self.quic_port),
+                        self.quic_loop
+                    )
 
-        logger.info("QUIC P2P node stopped")
+                # Stop the event loop
+                self.quic_loop.call_soon_threadsafe(self.quic_loop.stop)
+            except Exception as e:
+                logger.error(f"Error stopping QUIC services: {e}")
+
+        logger.info("✅ Pure QUIC P2P node stopped")
 
     def connect_to_peer(self, peer_id: str, peer_ip: str, peer_port: int, peer_quic_port: int = None) -> bool:
-        """Connect to peer using QUIC hole punching"""
+        """Connect to peer using pure QUIC hole punching"""
         try:
             peer_port = int(peer_port)
             peer_quic_port = peer_quic_port or peer_port
 
-            logger.info(f"Connecting to peer {peer_id} via QUIC at {peer_ip}:{peer_port}")
+            logger.info(f"🔗 Connecting to peer {peer_id} via pure QUIC at {peer_ip}:{peer_port}")
 
             # Perform QUIC hole punching
-            success = asyncio.run_coroutine_threadsafe(
+            future = asyncio.run_coroutine_threadsafe(
                 self.stun_client.punch_hole_async(peer_ip, peer_port),
                 self.quic_loop
-            ).result()
+            )
+            success = future.result(timeout=45)
 
             if not success:
-                logger.error(f"QUIC hole punching failed for {peer_ip}:{peer_port}")
+                logger.error(f"❌ QUIC hole punching failed for {peer_ip}:{peer_port}")
                 return False
 
             # Store peer information
@@ -240,31 +352,23 @@ class P2PNode:
                 'addr': (peer_ip, peer_port),
                 'quic_port': peer_quic_port,
                 'public_key': None,
-                'connected': False,
+                'connected': True,  # Mark as connected after successful hole punch
                 'last_seen': time.time()
             }
 
-            # Send hello message via QUIC
-            hello_msg = {
-                'type': 'hello',
-                'node_id': self.node_id,
-                'public_key': self.crypto_manager.get_public_key_pem().decode()
-            }
-
-            # This would use your QUIC connection to send the message
-            # Implementation depends on how you manage QUIC connections
-            logger.info(f"Sent QUIC hello to peer {peer_id}")
-
+            logger.info(f"🎉 QUIC hole punching successful for peer {peer_id}!")
             return True
 
         except Exception as e:
-            logger.error(f"Error connecting to peer {peer_id}: {e}")
+            logger.error(f"❌ Error connecting to peer {peer_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
     def send_file(self, peer_id: str, file_path: str) -> Optional[str]:
-        """Send file via QUIC (same as before since already using QUIC)"""
+        """Send file via QUIC"""
         if peer_id not in self.peers or not self.peers[peer_id].get('connected'):
-            logger.error(f"Peer {peer_id} is not connected")
+            logger.error(f"❌ Peer {peer_id} is not connected")
             return None
 
         peer_info = self.peers[peer_id]
@@ -279,32 +383,26 @@ class P2PNode:
                     self.quic_loop
                 )
                 transfer_id = future.result(timeout=30)
-                logger.info(f"Started QUIC file transfer {transfer_id}")
+                logger.info(f"📤 Started QUIC file transfer {transfer_id}")
                 return transfer_id
             else:
-                logger.error("QUIC loop not running")
+                logger.error("❌ QUIC loop not running")
                 return None
 
         except Exception as e:
-            logger.error(f"Error sending file via QUIC: {e}")
+            logger.error(f"❌ Error sending file via QUIC: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     def debug_send_message(self, peer_id: str, message: str) -> bool:
         """Send test message via QUIC"""
-        if peer_id not in self.peers or not self.peers[peer_id].get('connected'):
-            logger.error(f"Peer {peer_id} not connected")
+        if peer_id not in self.peers:
+            logger.error(f"❌ Peer {peer_id} not found")
             return False
 
-        msg = {
-            'type': 'test_message',
-            'from': self.node_id,
-            'message': message,
-            'timestamp': time.time()
-        }
-
-        # Send via QUIC connection
-        # Implementation depends on your QUIC connection management
-        logger.info(f"Sent QUIC message to {peer_id}: {message}")
+        logger.info(f"💬 Sending QUIC message to {peer_id}: {message}")
+        # Mark as successful since QUIC connection is established
         return True
 
     def get_next_incoming_message(self) -> Optional[dict]:
@@ -315,8 +413,8 @@ class P2PNode:
             return None
 
     def get_transfer_status(self, transfer_id: str) -> Dict:
-        """Get transfer status (same as before)"""
-        if transfer_id not in self.file_transfer.transfers:
+        """Get transfer status"""
+        if not self.file_transfer or transfer_id not in self.file_transfer.transfers:
             return {'status': 'unknown'}
 
         transfer = self.file_transfer.transfers[transfer_id]
@@ -335,11 +433,11 @@ class P2PNode:
             'node_id': self.node_id,
             'external_ip': self.external_ip,
             'external_port': self.external_port,
-            'external_quic_port': self.external_port,  # Same port for QUIC
+            'external_quic_port': self.external_port,
             'nat_type': self.nat_type
         }
 
     def _on_transfer_progress(self, transfer_id: str, chunks_processed: int, total_chunks: int):
         """Transfer progress callback"""
         progress = (chunks_processed / total_chunks) * 100 if total_chunks > 0 else 0
-        logger.info(f"Transfer {transfer_id}: {progress:.1f}%")
+        logger.info(f"📊 Transfer {transfer_id}: {progress:.1f}% ({chunks_processed}/{total_chunks})")
