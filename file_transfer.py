@@ -341,6 +341,9 @@ class FileTransfer:
             self._handle_file_end(msg, addr)
         elif mtype == FILE_END_ACK:
             self._handle_file_end_ack(msg)
+        elif mtype == FILE_CHUNK:
+            # Add this missing case to handle chunk headers
+            self._handle_file_chunk(msg, addr, peer_id)
 
     def _handle_file_init_enhanced(self, msg: Dict[str, Any], addr: Tuple[str, int], peer_id: str):
         """Enhanced file init handler with receive buffer setup"""
@@ -540,9 +543,29 @@ class FileTransfer:
             return self.crypto.decrypt_data(peer_id, ciphertext)
         return ciphertext
 
-    def handle_binary_data(self, *_):
-        """Binary datagrams that arrive outside the expected flow are ignored."""
-        logger.debug("Received stray binary data – dropping")
+    def handle_binary_data(self, data: bytes, addr: Tuple[str, int], peer_id: str):
+        """Process binary data (actual chunk content)"""
+        with self.lock:
+            # Find which transfer is expecting data from this peer
+            for transfer_id, tf in self.transfers.items():
+                if (tf["direction"] == "in" and
+                        tf["peer_addr"] == addr and
+                        "expected_chunk_index" in tf):
+
+                    # Process this chunk
+                    chunk_index = tf.pop("expected_chunk_index")
+                    expected_size = tf.pop("expected_chunk_size", len(data))
+
+                    # Verify chunk size
+                    if len(data) != expected_size:
+                        logger.warning(
+                            f"Chunk size mismatch for {transfer_id}: expected {expected_size}, got {len(data)}")
+                        return
+
+                    self._process_chunk(transfer_id, chunk_index, peer_id, addr, data)
+                    return
+
+            logger.debug("Received unexpected binary data – dropping")
 
     # Add method for processing chunks (called by P2PNode)
     def _process_chunk(self, transfer_id: str, chunk_index: int, peer_id: str,
