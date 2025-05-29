@@ -279,14 +279,14 @@ class FileTransfer:
                     "checksum": checksum  # Add checksum to header
                 }
 
-                ack_event = threading.Event()
-                with self.lock:
-                    tf["ack_events"][chunk_index] = ack_event
-                    tf["current_chunk_status"] = {"acked": False, "nak": False}
-
                 # Retry loop - continues until success or max retries
                 success = False
                 while retries[chunk_index] < self.MAX_RETRIES and not success:
+                    ack_event = threading.Event()
+                    with self.lock:
+                        tf["ack_events"][chunk_index] = ack_event
+                        tf["current_chunk_status"] = {"acked": False, "nak": False}  # Reset status for each attempt
+
                     # Header then binary payload
                     self._send_json(header, peer_addr)
                     self.socket.sendto(ciphertext, peer_addr)
@@ -300,7 +300,6 @@ class FileTransfer:
                             if tf["current_chunk_status"]["nak"]:
                                 # Checksum failed at receiver, retry
                                 logger.warning(f"Checksum mismatch for chunk {chunk_index} - retransmitting")
-                                tf["current_chunk_status"]["nak"] = False  # Reset NAK flag
                                 retries[chunk_index] += 1
                                 continue
                             else:
