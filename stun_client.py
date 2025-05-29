@@ -1,31 +1,34 @@
 """
-Pure QUIC-based NAT discovery and hole punching.
-Uses QUIC connections to discover external IP and perform hole punching.
+STUN client for NAT traversal.
+Uses a simplified implementation without external dependencies.
 """
+import socket
 import logging
 import random
 import time
-import asyncio
-import json
-import ssl
-from typing import Tuple, Optional
-import socket
+import struct
+import threading
+from typing import Tuple, Optional, Dict
 
-from aioquic.asyncio import connect, serve
-from aioquic.asyncio.protocol import QuicConnectionProtocol
-from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import QuicEvent, StreamDataReceived, ConnectionTerminated
-
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Public services that support QUIC (HTTP/3)
-QUIC_DISCOVERY_SERVICES = [
-('stun.l.google.com', 443),  # Use HTTPS/HTTP3 ports for QUIC
-    ('cloudflare-quic.com', 443),
-    ('google.com', 443),
-    ('facebook.com', 443),
-    ('github.com', 443)
+# List of public STUN servers
+STUN_SERVERS = [
+    ('stun.l.google.com', 19302),
+    ('stun1.l.google.com', 19302),
+    ('stun2.l.google.com', 19302),
+    ('stun.ekiga.net', 3478),
+    ('stun.ideasip.com', 3478),
+    ('stun.schlund.de', 3478),
+    ('stun.stunprotocol.org', 3478),
+    ('stun.voiparound.com', 3478),
+    ('stun.voipbuster.com', 3478),
+    ('stun.voipstunt.com', 3478),
+    ('stun.voxgratia.org', 3478)
 ]
+
 
 class NATType:
     """NAT type constants"""
@@ -37,394 +40,167 @@ class NATType:
     SYMMETRIC = "Symmetric"
     BLOCKED = "Blocked"
 
-class QuicNATDiscoveryProtocol(QuicConnectionProtocol):
-    """QUIC protocol for NAT discovery"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.discovery_complete = False
-        self.external_address = None
-        self.connection_successful = False
-
-    def quic_event_received(self, event: QuicEvent):
-        if isinstance(event, StreamDataReceived):
-            # Any response means we can connect to external services
-            self.connection_successful = True
-            self.discovery_complete = True
-        elif isinstance(event, ConnectionTerminated):
-            # Even if connection terminates, we know we could connect
-            if not self.discovery_complete:
-                self.connection_successful = True
-                self.discovery_complete = True
-
-class QuicHolePunchProtocol(QuicConnectionProtocol):
-    """QUIC protocol for hole punching"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.hole_punched = False
-        self.peer_connected = False
-        self.messages_received = []
-
-    def quic_event_received(self, event: QuicEvent):
-        if isinstance(event, StreamDataReceived):
-            try:
-                data = json.loads(event.data.decode())
-                message_type = data.get('type')
-
-                if message_type == 'hole_punch':
-                    self.hole_punched = True
-                    # Send response
-                    stream_id = self._connection.get_next_available_stream_id()
-                    response = {'type': 'hole_punch_ack', 'message': 'hole punched successfully'}
-                    self._connection.send_stream_data(
-                        stream_id,
-                        json.dumps(response).encode(),
-                        end_stream=True
-                    )
-                    logger.info("✅ Received QUIC hole punch request and sent ACK")
-
-                elif message_type == 'hole_punch_ack':
-                    self.peer_connected = True
-                    logger.info("✅ Received QUIC hole punch ACK - connection established")
-
-                self.messages_received.append(data)
-
-            except Exception as e:
-                logger.error(f"Error processing QUIC hole punch message: {e}")
 
 class STUNClient:
-    """Pure QUIC client for NAT discovery and hole punching"""
+    """Client for STUN server communication and NAT traversal"""
 
     def __init__(self, local_port: int = 0):
+        """
+        Initialize the STUN client.
+
+        Args:
+            local_port: Local UDP port to bind to. If 0, a random port will be assigned.
+        """
         self.local_port = local_port if local_port != 0 else random.randint(10000, 65000)
         self.nat_type = NATType.UNKNOWN
         self.external_ip = None
         self.external_port = None
-        self.quic_server = None
-
-    async def discover_nat_async(self) -> Tuple[str, str, int]:
-        """Discover NAT type and external IP using QUIC connections"""
-        logger.info("🔍 Starting QUIC-based NAT discovery...")
-
-        # Start our QUIC server first
-        await self._start_discovery_server()
-
-        # Test QUIC connectivity to external services
-        external_connectivity = await self._test_external_quic_connectivity()
-
-        if external_connectivity:
-            logger.info("✅ QUIC external connectivity confirmed")
-            # Get external IP using HTTP service
-            self.external_ip = await self._get_external_ip_http()
-            self.external_port = self.local_port
-            self.nat_type = NATType.FULL_CONE  # Assume full cone if QUIC works
-        else:
-            logger.warning("⚠️ QUIC external connectivity failed, using fallback")
-            self.external_ip, self.external_port = await self._fallback_discovery()
-            self.nat_type = NATType.UNKNOWN
-
-        logger.info(f"🌐 Discovery complete - IP: {self.external_ip}, Port: {self.external_port}")
-        return self.nat_type, self.external_ip, self.external_port
-
-    async def _start_discovery_server(self):
-        """Start QUIC server for discovery and hole punching"""
-        configuration = QuicConfiguration(
-            is_client=False,
-            certificate=self._generate_self_signed_cert(),
-            private_key=self._generate_private_key(),
-            idle_timeout=60.0
-        )
-
-        def create_protocol():
-            return QuicNATDiscoveryProtocol()
-
-        try:
-            self.quic_server = await serve(
-                "0.0.0.0",
-                self.local_port,
-                configuration=configuration,
-                create_protocol=create_protocol
-            )
-
-            logger.info(f"🚀 QUIC discovery server started on port {self.local_port}")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to start QUIC discovery server: {e}")
-            raise
-
-    async def _test_external_quic_connectivity(self) -> bool:
-        """Test if we can make QUIC connections to external services"""
-        for host, port in QUIC_DISCOVERY_SERVICES:
-            try:
-                logger.info(f"🔗 Testing QUIC connectivity to {host}:{port}")
-
-                configuration = QuicConfiguration(
-                    is_client=True,
-                    verify_mode=ssl.CERT_NONE,  # Skip cert verification for discovery
-                    alpn_protocols=["h3", "h3-29", "h3-27"]
-                )
-
-                # Try to establish QUIC connection
-                protocol = await asyncio.wait_for(
-                    connect(
-                        host,
-                        port,
-                        configuration=configuration,
-                        create_protocol=QuicNATDiscoveryProtocol
-                    ).__aenter__(),
-                    timeout=10.0
-                )
-
-                # Send a simple HTTP/3 request or just test connection
-                stream_id = protocol._connection.get_next_available_stream_id()
-                request = f"GET / HTTP/3\r\nHost: {host}\r\n\r\n"
-                protocol._connection.send_stream_data(
-                    stream_id,
-                    request.encode(),
-                    end_stream=True
-                )
-
-                # Wait for any response
-                timeout = time.time() + 5
-                while time.time() < timeout:
-                    if protocol.connection_successful or protocol.discovery_complete:
-                        logger.info(f"✅ QUIC connectivity test successful with {host}")
-                        return True
-                    await asyncio.sleep(0.1)
-
-                # Close connection
-                await protocol.__aexit__(None, None, None)
-
-            except Exception as e:
-                logger.warning(f"⚠️ QUIC test failed for {host}: {e}")
-                continue
-
-        logger.error("❌ All QUIC connectivity tests failed")
-        return False
-
-    async def _get_external_ip_http(self) -> str:
-        """Get external IP using HTTP service"""
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.get('https://api.ipify.org', timeout=10) as response:
-                    external_ip = await response.text()
-                    logger.info(f"🌍 External IP discovered: {external_ip}")
-                    return external_ip.strip()
-        except Exception as e:
-            logger.warning(f"⚠️ HTTP IP discovery failed: {e}")
-            return await self._fallback_ip_discovery()
-
-    async def _fallback_ip_discovery(self) -> str:
-        """Fallback IP discovery method"""
-        try:
-            # Try alternative IP services
-            services = [
-                'https://ipinfo.io/ip',
-                'https://checkip.amazonaws.com',
-                'https://icanhazip.com'
-            ]
-
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                for service in services:
-                    try:
-                        async with session.get(service, timeout=5) as response:
-                            ip = await response.text()
-                            return ip.strip()
-                    except:
-                        continue
-
-            # Last resort - use local IP
-            hostname = socket.gethostname()
-            local_ip = socket.gethostbyname(hostname)
-            logger.warning(f"🏠 Using local IP as fallback: {local_ip}")
-            return local_ip
-
-        except Exception as e:
-            logger.error(f"❌ All IP discovery methods failed: {e}")
-            return "127.0.0.1"
-
-    async def _fallback_discovery(self) -> Tuple[str, int]:
-        """Fallback discovery when QUIC fails"""
-        ip = await self._fallback_ip_discovery()
-        return ip, self.local_port
-
-    async def punch_hole_async(self, peer_ip: str, peer_port: int, attempts: int = 3) -> bool:
-        """Perform QUIC hole punching to establish connection with peer"""
-        logger.info(f"🔓 Attempting QUIC hole punching to {peer_ip}:{peer_port}")
-
-        configuration = QuicConfiguration(
-            is_client=True,
-            verify_mode=ssl.CERT_NONE,
-            idle_timeout=30.0
-        )
-
-        for attempt in range(attempts):
-            try:
-                logger.info(f"🎯 QUIC hole punch attempt {attempt + 1}/{attempts}")
-
-                # Try to establish QUIC connection
-                protocol = await asyncio.wait_for(
-                    connect(
-                        peer_ip,
-                        peer_port,
-                        configuration=configuration,
-                        create_protocol=QuicHolePunchProtocol
-                    ).__aenter__(),
-                    timeout=15.0
-                )
-
-                # Send hole punch message
-                stream_id = protocol._connection.get_next_available_stream_id()
-                message = {
-                    'type': 'hole_punch',
-                    'attempt': attempt + 1,
-                    'timestamp': time.time(),
-                    'from_port': self.local_port
-                }
-
-                protocol._connection.send_stream_data(
-                    stream_id,
-                    json.dumps(message).encode(),
-                    end_stream=True
-                )
-
-                logger.info(f"📤 Sent QUIC hole punch message")
-
-                # Wait for response
-                timeout = time.time() + 10
-                while time.time() < timeout:
-                    if protocol.peer_connected:
-                        logger.info(f"🎉 QUIC hole punch successful on attempt {attempt + 1}!")
-                        return True
-                    await asyncio.sleep(0.1)
-
-                # Close connection for this attempt
-                await protocol.__aexit__(None, None, None)
-
-            except asyncio.TimeoutError:
-                logger.warning(f"⏱️ Attempt {attempt + 1} timed out")
-            except Exception as e:
-                logger.warning(f"⚠️ Attempt {attempt + 1} failed: {e}")
-
-            if attempt < attempts - 1:
-                logger.info("⏳ Waiting before next attempt...")
-                await asyncio.sleep(3)
-
-        logger.error("❌ QUIC hole punching failed after all attempts")
-        return False
-
-    async def start_hole_punch_server(self):
-        """Start QUIC server to accept hole punch attempts"""
-        if self.quic_server:
-            logger.info("✅ QUIC hole punch server already running")
-            return
-
-        configuration = QuicConfiguration(
-            is_client=False,
-            certificate=self._generate_self_signed_cert(),
-            private_key=self._generate_private_key(),
-            idle_timeout=120.0
-        )
-
-        def create_protocol():
-            return QuicHolePunchProtocol()
-
-        try:
-            self.quic_server = await serve(
-                "0.0.0.0",
-                self.local_port,
-                configuration=configuration,
-                create_protocol=create_protocol
-            )
-
-            logger.info(f"🎯 QUIC hole punch server ready on port {self.local_port}")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to start QUIC hole punch server: {e}")
-            raise
+        self.socket = None
 
     def discover_nat(self) -> Tuple[str, str, int]:
-        """Synchronous wrapper for async NAT discovery"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        """
+        Discover NAT type and external IP:port using STUN.
+
+        Returns:
+            Tuple of (NAT type, external IP, external port)
+        """
+        if not self.socket:
+            self.create_socket()
+
+        # Try multiple STUN servers in case some are down
+        for stun_server, stun_port in STUN_SERVERS:
+            try:
+                logger.info(f"Trying STUN server {stun_server}:{stun_port}")
+
+                # Create a simple STUN binding request
+                transaction_id = random.randbytes(12)
+
+                # STUN Message Type: Binding Request (0x0001)
+                # Message Length: 0 (no attributes)
+                # Magic Cookie: 0x2112A442
+                # Transaction ID: 12 random bytes
+                stun_request = struct.pack(
+                    '>HHII',
+                    0x0001,  # Binding Request
+                    0x0000,  # Message Length
+                    0x2112A442,  # Magic Cookie
+                    int.from_bytes(transaction_id[:4], byteorder='big')
+                ) + transaction_id[4:]
+
+                # Send the STUN request
+                self.socket.sendto(stun_request, (stun_server, stun_port))
+
+                # Wait for response
+                self.socket.settimeout(5)
+                try:
+                    data, addr = self.socket.recvfrom(1024)
+
+                    # Parse the STUN response
+                    if len(data) < 20:
+                        logger.warning(f"Invalid STUN response from {stun_server}")
+                        continue
+
+                    # Check if it's a STUN Binding Response (0x0101)
+                    msg_type = struct.unpack('>H', data[0:2])[0]
+                    if msg_type != 0x0101:
+                        logger.warning(f"Not a STUN Binding Response: {msg_type:04x}")
+                        continue
+
+                    # Parse the response to find the XOR-MAPPED-ADDRESS attribute (0x0020)
+                    # Skip the 20-byte header
+                    pos = 20
+                    while pos + 4 <= len(data):
+                        attr_type = struct.unpack('>H', data[pos:pos + 2])[0]
+                        attr_len = struct.unpack('>H', data[pos + 2:pos + 4])[0]
+
+                        if attr_type == 0x0020:  # XOR-MAPPED-ADDRESS
+                            if attr_len >= 8:  # IPv4 address
+                                # Skip the first 4 bytes (family and port)
+                                xor_port = struct.unpack('>H', data[pos + 6:pos + 8])[0] ^ (0x2112A442 >> 16)
+                                xor_ip = struct.unpack('>I', data[pos + 8:pos + 12])[0] ^ 0x2112A442
+                                ip = socket.inet_ntoa(struct.pack('>I', xor_ip))
+
+                                self.external_ip = ip
+                                self.external_port = xor_port
+                                self.nat_type = NATType.FULL_CONE  # Simplified - assume Full Cone
+
+                                logger.info(f"NAT Type: {self.nat_type}")
+                                logger.info(f"External IP: {self.external_ip}")
+                                logger.info(f"External Port: {self.external_port}")
+
+                                return self.nat_type, self.external_ip, self.external_port
+
+                        pos += 4 + attr_len  # Move to the next attribute
+                        # Align to 4-byte boundary
+                        if attr_len % 4 != 0:
+                            pos += 4 - (attr_len % 4)
+
+                except socket.timeout:
+                    logger.warning(f"Timeout waiting for STUN response from {stun_server}")
+                    continue
+
+            except Exception as e:
+                logger.error(f"Error with STUN server {stun_server}: {e}")
+                continue
+
+        logger.error("Failed to discover external IP and port using any STUN server")
+        return NATType.UNKNOWN, None, None
+
+    def create_socket(self) -> socket.socket:
+        """
+        Create and bind a UDP socket for P2P communication.
+
+        Returns:
+            Bound UDP socket
+        """
+        if self.socket:
+            return self.socket
+
         try:
-            return loop.run_until_complete(self.discover_nat_async())
-        finally:
-            loop.close()
+            # Create UDP socket
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    def punch_hole(self, peer_ip: str, peer_port: int, attempts: int = 3) -> bool:
-        """Synchronous wrapper for async hole punching"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(self.punch_hole_async(peer_ip, peer_port, attempts))
-        finally:
-            loop.close()
+            # Bind to the specified local port
+            self.socket.bind(('0.0.0.0', self.local_port))
 
-    def _generate_self_signed_cert(self):
-        """Generate self-signed certificate for QUIC"""
-        from cryptography import x509
-        from cryptography.x509.oid import NameOID
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        import datetime
-        import ipaddress
+            # Get the actual port (in case we used 0)
+            self.local_port = self.socket.getsockname()[1]
+            logger.info(f"Socket bound to local port {self.local_port}")
 
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-        )
+            return self.socket
 
-        subject = issuer = x509.Name([
-            x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "P2P QUIC"),
-            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
-        ])
+        except Exception as e:
+            logger.error(f"Error creating socket: {e}")
+            raise
 
-        cert = x509.CertificateBuilder().subject_name(
-            subject
-        ).issuer_name(
-            issuer
-        ).public_key(
-            private_key.public_key()
-        ).serial_number(
-            x509.random_serial_number()
-        ).not_valid_before(
-            datetime.datetime.utcnow()
-        ).not_valid_after(
-            datetime.datetime.utcnow() + datetime.timedelta(days=365)
-        ).add_extension(
-            x509.SubjectAlternativeName([
-                x509.DNSName("localhost"),
-                x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
-                x509.IPAddress(ipaddress.ip_address("0.0.0.0")),
-            ]),
-            critical=False,
-        ).sign(private_key, hashes.SHA256())
+    def punch_hole(self, peer_ip: str, peer_port: int, attempts: int = 5) -> bool:
+        """
+        Perform UDP hole punching to establish a direct connection with a peer.
 
-        return cert.public_bytes(serialization.Encoding.PEM)
+        Args:
+            peer_ip: External IP of the peer
+            peer_port: External port of the peer
+            attempts: Number of hole punching attempts
 
-    def _generate_private_key(self):
-        """Generate private key for QUIC"""
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.hazmat.primitives import serialization
+        Returns:
+            True if hole punching was attempted, False otherwise
+        """
+        if not self.socket:
+            self.create_socket()
 
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-        )
+        logger.info(f"Attempting to punch hole to {peer_ip}:{peer_port}")
 
-        return private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
+        # Send multiple packets to punch a hole in the NAT
+        for i in range(attempts):
+            try:
+                # Send a hole punching message
+                self.socket.sendto(b"HOLE_PUNCHING", (peer_ip, peer_port))
+                logger.info(f"Sent hole punching packet {i + 1}/{attempts}")
+                time.sleep(0.5)  # Short delay between attempts
+            except Exception as e:
+                logger.error(f"Error during hole punching: {e}")
+                return False
 
-    # Legacy compatibility methods
-    def create_socket(self):
-        """Legacy method - not needed for pure QUIC implementation"""
-        logger.info("create_socket called but not needed for pure QUIC implementation")
-        return None
+        logger.info(f"Hole punching to {peer_ip}:{peer_port} completed")
+        return True
