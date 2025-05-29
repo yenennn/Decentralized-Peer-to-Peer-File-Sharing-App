@@ -311,15 +311,12 @@ class P2PNode:
 
                 # If we're expecting binary data, process it directly without trying JSON parsing
                 if self.expecting_binary:
-                    # Reset the flag immediately
-                    self.expecting_binary = False
-
                     if peer_id and self.expected_transfer_id is not None and self.expected_chunk_index is not None:
                         logger.debug(
                             f"Processing binary chunk data for transfer {self.expected_transfer_id}, chunk {self.expected_chunk_index}")
 
                         # Process the binary data directly
-                        self.file_transfer._process_chunk(
+                        checksum_valid = self.file_transfer._process_chunk(
                             self.expected_transfer_id,
                             self.expected_chunk_index,
                             peer_id,
@@ -327,12 +324,18 @@ class P2PNode:
                             data
                         )
 
-                        # Clear the expected values
-                        self.expected_transfer_id = None
-                        self.expected_chunk_index = None
-                        self.expected_chunk_size = 0
+                        # Only reset the expecting_binary flag if the checksum was valid
+                        # Otherwise, we need to keep expecting another binary payload for the same chunk
+                        if checksum_valid:
+                            # Reset only when checksum passes
+                            self.expecting_binary = False
+                            self.expected_transfer_id = None
+                            self.expected_chunk_index = None
+                            self.expected_chunk_size = 0
                     else:
                         logger.warning(f"Received binary data but missing context information")
+                        # Reset in case of error to avoid getting stuck
+                        self.expecting_binary = False
 
                     continue  # Skip JSON parsing for binary data
 

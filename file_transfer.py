@@ -177,13 +177,13 @@ class FileTransfer:
                     ev.set()
 
     def _process_chunk(self, transfer_id: str, chunk_index: int, peer_id: str,
-                       addr: Tuple[str, int], data: bytes):
+                       addr: Tuple[str, int], data: bytes) -> bool:
         """Decrypt & write the chunk, then ACK it back to the sender."""
         with self.lock:
             tf = self.transfers.get(transfer_id)
             if not tf or tf["direction"] != "in":
                 logger.warning(f"Data chunk for unknown or outbound transfer {transfer_id}")
-                return
+                return False
 
             # Verify checksum
             received_checksum = hashlib.md5(data).hexdigest()
@@ -198,14 +198,14 @@ class FileTransfer:
                     "chunk_index": chunk_index
                 }
                 self._send_json(nak_msg, addr)
-                return
+                return False  # Return False for checksum mismatch
 
             try:
                 plaintext = self._decrypt(peer_id, data)
             except Exception as exc:
                 logger.error(f"Decryption failed - aborting transfer {transfer_id}: {exc}")
                 tf["status"] = "failed"
-                return
+                return False
 
             # Lazy-open file handle on first chunk
             if "file_handle" not in tf:
@@ -234,6 +234,8 @@ class FileTransfer:
                 end_ack = {"type": FILE_END_ACK, "transfer_id": transfer_id}
                 self._send_json(end_ack, addr)
                 logger.info(f"Completed download of {tf['file_name']} ({transfer_id})")
+
+            return True  # Return True for successful processing
     # ---------------------------------------------------------------------
     # Internal helpers
     # ---------------------------------------------------------------------
