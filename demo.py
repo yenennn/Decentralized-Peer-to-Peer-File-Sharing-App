@@ -1,6 +1,6 @@
 """
-Demo script for the P2P file sharing system with QUIC support.
-Shows how to use the system to share files between peers.
+Demo script for the P2P file sharing system with pure QUIC implementation.
+Shows how to use the system to share files between peers using QUIC for everything.
 """
 import os
 import sys
@@ -8,6 +8,7 @@ import time
 import logging
 import argparse
 import threading
+import asyncio
 from typing import Dict, List, Tuple, Optional
 
 from p2p_node import P2PNode
@@ -20,56 +21,58 @@ logger = logging.getLogger(__name__)
 def print_banner():
     """Print a banner for the demo"""
     print("\n" + "=" * 80)
-    print("Decentralized P2P File Sharing Demo with QUIC")
+    print("🚀 Decentralized P2P File Sharing Demo - Pure QUIC Edition")
     print("=" * 80)
-    print("This demo shows how to use the P2P file sharing system to share files between peers.")
-    print("Uses STUN for NAT traversal, UDP for peer discovery, and QUIC for reliable file transfers.")
-    print("Files are encrypted with AES and transferred directly between peers using QUIC.\n")
+    print("This demo shows how to use the P2P file sharing system with pure QUIC communication.")
+    print("✨ NEW: QUIC is used for NAT hole punching, peer discovery, AND file transfers!")
+    print("🔒 Built-in encryption, reliable delivery, and multiplexing in one protocol.")
+    print("🌐 No more UDP - everything runs over secure QUIC connections.\n")
 
 
 def print_peer_info(node: P2PNode):
     """Print information about the peer"""
     info = node.get_peer_info()
-    print("\nYour Peer Information:")
-    print(f"Node ID: {info['node_id']}")
-    print(f"External IP: {info['external_ip']}")
-    print(f"External UDP Port: {info['external_port']} (for peer discovery)")
-    print(f"External QUIC Port: {info['external_quic_port']} (for file transfers)")
-    print(f"NAT Type: {info['nat_type']}")
-    print("\nShare this information with other peers to connect.")
-    print("Note: Other peers need your UDP port for initial connection.")
+    print("\n🔍 Your Peer Information:")
+    print(f"   Node ID: {info['node_id']}")
+    print(f"   External IP: {info['external_ip']}")
+    print(f"   QUIC Port: {info['external_port']} (unified for all communication)")
+    print(f"   NAT Type: {info['nat_type']}")
+    print("\n📋 Share this information with other peers to connect:")
+    print(f"   connect {info['node_id']} {info['external_ip']} {info['external_port']}")
+    print("\n💡 Note: QUIC handles both discovery and file transfers on the same port!")
     print("=" * 80 + "\n")
 
 
 def print_help():
     """Print help information"""
-    print("\nCommands:")
-    print("  connect <peer_id> <peer_ip> <peer_udp_port> [peer_quic_port] - Connect to a peer")
-    print("  send <peer_id> <file_path> - Send a file to a peer via QUIC")
-    print("  msg <peer_id> <message> - Send a test message to a peer via UDP")
-    print("  status <transfer_id> - Check the status of a file transfer")
-    print("  list - List connected peers")
-    print("  info - Show your peer information")
-    print("  help - Show this help message")
-    print("  exit - Exit the demo")
-    print("\nNote: File transfers use QUIC (reliable), messages use UDP (fast)")
+    print("\n📚 Available Commands:")
+    print("  🔗 connect <peer_id> <peer_ip> <quic_port> - Connect to a peer via QUIC")
+    print("  📤 send <peer_id> <file_path> - Send a file to a peer via QUIC")
+    print("  💬 msg <peer_id> <message> - Send a test message to a peer via QUIC")
+    print("  📊 status <transfer_id> - Check the status of a file transfer")
+    print("  📋 list - List connected peers")
+    print("  ℹ️  info - Show your peer information")
+    print("  ❓ help - Show this help message")
+    print("  🚪 exit - Exit the demo")
+    print("\n🎯 Note: Everything now uses QUIC - secure, reliable, and fast!")
+    print("🔐 All communication is encrypted and authenticated by default.")
 
 
 def monitor_transfer(node: P2PNode, transfer_id: str):
     """Monitor a file transfer and print updates"""
-    print(f"Monitoring transfer {transfer_id}...")
+    print(f"📈 Monitoring transfer {transfer_id}...")
     last_progress = -1
 
     while True:
         try:
             status = node.get_transfer_status(transfer_id)
             if status['status'] == 'unknown':
-                print(f"Transfer {transfer_id} not found or completed")
+                print(f"❌ Transfer {transfer_id} not found or completed")
                 break
 
             current_progress = status.get('progress', 0)
             if current_progress != last_progress:
-                print(f"Transfer: {status['file_name']} - {current_progress:.1f}% - {status['status']}")
+                print(f"📊 Transfer: {status['file_name']} - {current_progress:.1f}% - {status['status']}")
                 last_progress = current_progress
 
             if status['status'] in ['completed', 'failed']:
@@ -86,18 +89,66 @@ def monitor_transfer(node: P2PNode, transfer_id: str):
             break
 
 
+def print_startup_status(external_ip: str, external_port: int):
+    """Print startup status with improved formatting"""
+    print(f"\n🎉 QUIC P2P Node Started Successfully!")
+    print(f"   🌐 External IP: {external_ip}")
+    print(f"   🔌 QUIC Port: {external_port} (unified for all communication)")
+    print(f"   🔒 Security: TLS 1.3 encryption enabled")
+    print(f"   🚀 Features: Hole punching + File transfer + Messaging")
+
+
+def handle_connection_attempt(node: P2PNode, peer_id: str, peer_ip: str, peer_port: int):
+    """Handle connection attempt with better user feedback"""
+    print(f"🔄 Initiating QUIC connection to peer {peer_id}...")
+    print(f"   📍 Target: {peer_ip}:{peer_port}")
+    print(f"   🔓 Attempting QUIC hole punching...")
+
+    # Show a progress indicator
+    def show_progress():
+        for i in range(10):  # 10 seconds max
+            if peer_id in node.peers and node.peers[peer_id].get('connected'):
+                return
+            print(".", end="", flush=True)
+            time.sleep(1)
+
+    progress_thread = threading.Thread(target=show_progress, daemon=True)
+    progress_thread.start()
+
+    success = node.connect_to_peer(peer_id, peer_ip, peer_port)
+    progress_thread.join(timeout=1)
+    print()  # New line after progress dots
+
+    if success:
+        print("✅ QUIC connection initiated successfully!")
+        print("   ⏳ Waiting for peer handshake... (check 'list' command)")
+    else:
+        print("❌ Failed to initiate QUIC connection")
+        print("   💡 Tips:")
+        print("      - Check if peer is online and listening")
+        print("      - Verify IP address and port")
+        print("      - Ensure firewalls allow QUIC traffic")
+
+
 def main():
     """Main function for the demo"""
-    parser = argparse.ArgumentParser(description='P2P File Sharing Demo with QUIC')
-    parser.add_argument('--port', type=int, default=0, help='Local UDP port (default: random)')
-    parser.add_argument('--quic-port', type=int, default=0, help='Local QUIC port (default: UDP port + 1000)')
-    parser.add_argument('--save-dir', type=str, default='./downloads', help='Directory to save received files')
+    parser = argparse.ArgumentParser(description='P2P File Sharing Demo - Pure QUIC Edition')
+    parser.add_argument('--port', type=int, default=0,
+                       help='Local QUIC port (default: random, replaces both UDP and QUIC ports)')
+    parser.add_argument('--save-dir', type=str, default='./downloads',
+                       help='Directory to save received files')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose logging')
     args = parser.parse_args()
+
+    # Set logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
     print_banner()
 
-    # Create and start P2P node
-    node = P2PNode(local_port=args.port, quic_port=args.quic_port, save_dir=args.save_dir)
+    # Create and start P2P node (quic_port is same as local_port now)
+    node = P2PNode(local_port=args.port, quic_port=args.port, save_dir=args.save_dir)
 
     # Add a thread to print received messages
     def print_incoming_messages():
@@ -105,7 +156,7 @@ def main():
             try:
                 msg = node.get_next_incoming_message()
                 if msg is not None:
-                    print(f"\n📨 [Message from {msg['peer_id']}]: {msg['message']}")
+                    print(f"\n💬 [QUIC Message from {msg['peer_id']}]: {msg['message']}")
                     print("> ", end="", flush=True)  # Re-show prompt
                 time.sleep(0.2)
             except Exception as e:
@@ -116,11 +167,9 @@ def main():
     message_thread.start()
 
     try:
-        # Start the node - now returns 3 values
+        # Start the node - returns unified values (same port for everything)
         external_ip, external_port, external_quic_port = node.start()
-        print(f"✅ P2P node started successfully!")
-        print(f"   UDP Port: {external_port} (peer discovery)")
-        print(f"   QUIC Port: {external_quic_port} (file transfers)")
+        print_startup_status(external_ip, external_port)
 
         print_peer_info(node)
         print_help()
@@ -128,7 +177,7 @@ def main():
         # Main command loop
         while True:
             try:
-                command = input("\n> ").strip()
+                command = input("\n🔸 > ").strip()
 
                 if not command:
                     continue
@@ -147,42 +196,38 @@ def main():
 
                 elif cmd == 'list':
                     if not node.peers:
-                        print("No connected peers")
+                        print("📭 No connected peers")
                     else:
-                        print("\nConnected Peers:")
+                        print("\n🔗 Connected Peers:")
                         for peer_id, peer in node.peers.items():
                             if peer.get('connected'):
-                                udp_port = peer['addr'][1]
+                                addr = peer.get('addr', ('unknown', 'unknown'))
                                 quic_port = peer.get('quic_port', 'unknown')
-                                print(f"  🔗 {peer_id} - {peer['addr'][0]}:{udp_port} (QUIC: {quic_port})")
+                                connection_type = "🔒 QUIC" if peer.get('quic_connected') else "🔗 Standard"
+                                print(f"   {connection_type} {peer_id} - {addr[0]}:{quic_port}")
+                        print()
 
                 elif cmd == 'connect':
                     if len(parts) < 4:
-                        print("Usage: connect <peer_id> <peer_ip> <peer_udp_port> [peer_quic_port]")
+                        print("❌ Usage: connect <peer_id> <peer_ip> <quic_port>")
+                        print("   Example: connect alice-node 192.168.1.100 12345")
                         continue
 
                     peer_id = parts[1]
                     peer_ip = parts[2]
 
                     try:
-                        peer_udp_port = int(parts[3])
-                        peer_quic_port = int(parts[4]) if len(parts) > 4 else None
+                        peer_port = int(parts[3])
                     except ValueError:
-                        print("Ports must be numbers")
+                        print("❌ Port must be a number")
                         continue
 
-                    print(f"🔄 Connecting to peer {peer_id} at {peer_ip}:{peer_udp_port}...")
-                    if peer_quic_port:
-                        print(f"   Using QUIC port: {peer_quic_port}")
-
-                    if node.connect_to_peer(peer_id, peer_ip, peer_udp_port, peer_quic_port):
-                        print("✅ Connection initiated. Check 'list' command to see if connection is established.")
-                    else:
-                        print("❌ Failed to initiate connection")
+                    handle_connection_attempt(node, peer_id, peer_ip, peer_port)
 
                 elif cmd == 'send':
                     if len(parts) < 3:
-                        print("Usage: send <peer_id> <file_path>")
+                        print("❌ Usage: send <peer_id> <file_path>")
+                        print("   Example: send alice-node ./myfile.txt")
                         continue
 
                     peer_id = parts[1]
@@ -197,12 +242,14 @@ def main():
                         continue
 
                     file_size = os.path.getsize(file_path)
-                    print(f"📤 Sending file {file_path} ({file_size} bytes) to peer {peer_id} via QUIC...")
+                    print(f"📤 Sending file via encrypted QUIC stream...")
+                    print(f"   📁 File: {file_path} ({file_size:,} bytes)")
+                    print(f"   🎯 Target: {peer_id}")
 
                     transfer_id = node.send_file(peer_id, file_path)
 
                     if transfer_id:
-                        print(f"✅ Transfer started with ID: {transfer_id}")
+                        print(f"✅ QUIC transfer started with ID: {transfer_id}")
                         # Start a thread to monitor the transfer
                         monitor_thread = threading.Thread(
                             target=monitor_transfer,
@@ -211,11 +258,11 @@ def main():
                         )
                         monitor_thread.start()
                     else:
-                        print("❌ Failed to start file transfer")
+                        print("❌ Failed to start QUIC file transfer")
 
                 elif cmd == 'status':
                     if len(parts) != 2:
-                        print("Usage: status <transfer_id>")
+                        print("❌ Usage: status <transfer_id>")
                         continue
 
                     transfer_id = parts[1]
@@ -224,18 +271,20 @@ def main():
                     if status['status'] == 'unknown':
                         print(f"❌ Transfer {transfer_id} not found")
                     else:
-                        print(f"\n📊 Transfer Status:")
-                        print(f"   File: {status['file_name']}")
-                        print(f"   Size: {status['file_size']} bytes")
-                        print(f"   Progress: {status['progress']:.1f}%")
-                        print(f"   Status: {status['status']}")
+                        print(f"\n📊 QUIC Transfer Status:")
+                        print(f"   📁 File: {status['file_name']}")
+                        print(f"   📏 Size: {status['file_size']:,} bytes")
+                        print(f"   📈 Progress: {status['progress']:.1f}%")
+                        print(f"   🔄 Status: {status['status']}")
                         if status['status'] == 'completed':
                             speed = status.get('speed', 0)
-                            print(f"   Speed: {speed:.2f} KB/s")
+                            print(f"   🚀 Speed: {speed:.2f} KB/s")
+                        print()
 
                 elif cmd == 'msg':
                     if len(parts) < 3:
-                        print("Usage: msg <peer_id> <message>")
+                        print("❌ Usage: msg <peer_id> <message>")
+                        print("   Example: msg alice-node Hello there!")
                         continue
 
                     peer_id = parts[1]
@@ -245,34 +294,50 @@ def main():
                         print(f"❌ Peer {peer_id} is not connected")
                         continue
 
-                    if node.debug_send_message(peer_id, "hello"):
-                        print(f"✅ Sent message to {peer_id}")
+                    print(f"📨 Sending QUIC message to {peer_id}...")
+                    if node.debug_send_message(peer_id, message):
+                        print(f"✅ Message sent via encrypted QUIC stream")
                     else:
-                        print(f"❌ Failed to send message to {peer_id}")
+                        print(f"❌ Failed to send QUIC message")
+
+                # Hidden debug commands
+                elif cmd == 'debug' and len(parts) > 1:
+                    if parts[1] == 'peers':
+                        print("\n🔍 Debug: Peer Details")
+                        for peer_id, peer in node.peers.items():
+                            print(f"   {peer_id}: {peer}")
+                    elif parts[1] == 'crypto':
+                        stats = node.crypto_manager.get_crypto_stats()
+                        print(f"\n🔐 Debug: Crypto Stats")
+                        print(f"   Encryptions: {stats['encryption_count']}")
+                        print(f"   Decryptions: {stats['decryption_count']}")
+                        print(f"   Active sessions: {stats['active_sessions']}")
 
                 else:
                     print(f"❌ Unknown command: {cmd}")
-                    print_help()
+                    print("💡 Type 'help' for available commands")
 
             except KeyboardInterrupt:
                 print("\n🔄 Interrupt received. Type 'exit' to quit.")
                 continue
             except Exception as e:
                 logger.error(f"Error processing command: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                if args.verbose:
+                    import traceback
+                    logger.error(traceback.format_exc())
 
     except Exception as e:
-        logger.error(f"Error starting P2P node: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        logger.error(f"Error starting QUIC P2P node: {e}")
+        if args.verbose:
+            import traceback
+            logger.error(traceback.format_exc())
         return 1
     finally:
         # Stop the P2P node
-        print("\n🔄 Stopping P2P node...")
+        print("\n🔄 Stopping QUIC P2P node...")
         try:
             node.stop()
-            print("✅ P2P node stopped. Goodbye!")
+            print("✅ QUIC P2P node stopped successfully. Goodbye! 👋")
         except Exception as e:
             logger.error(f"Error stopping node: {e}")
 
