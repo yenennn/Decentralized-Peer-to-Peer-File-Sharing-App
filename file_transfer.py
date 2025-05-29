@@ -258,7 +258,11 @@ class FileTransfer:
 
         # Send chunks sequentially with checksum verification
         with open(path, "rb") as fh:
-            for chunk_index in range(total_chunks):
+            chunk_index = 0
+            while chunk_index < total_chunks:
+                # Position file pointer at the correct chunk
+                fh.seek(chunk_index * self.DEFAULT_CHUNK_SIZE)
+
                 # Read & (optionally) encrypt
                 data = fh.read(self.DEFAULT_CHUNK_SIZE)
                 ciphertext = self._encrypt(tf["peer_id"], data)
@@ -281,7 +285,8 @@ class FileTransfer:
                     tf["current_chunk_status"] = {"acked": False, "nak": False}
 
                 # Retry loop - continues until success or max retries
-                while retries[chunk_index] < self.MAX_RETRIES:
+                success = False
+                while retries[chunk_index] < self.MAX_RETRIES and not success:
                     # Header then binary payload
                     self._send_json(header, peer_addr)
                     self.socket.sendto(ciphertext, peer_addr)
@@ -298,23 +303,27 @@ class FileTransfer:
                                 tf["current_chunk_status"]["nak"] = False  # Reset NAK flag
                                 retries[chunk_index] += 1
                                 continue
+                            else:
+                                # Success - mark chunk successful
+                                success = True
+                                tf["chunks_sent"] += 1
+                                if tf["progress_cb"]:
+                                    tf["progress_cb"](transfer_id, tf["chunks_sent"], total_chunks)
 
-                            # Success - next chunk
-                            tf["chunks_sent"] += 1
-                            if tf["progress_cb"]:
-                                tf["progress_cb"](transfer_id, tf["chunks_sent"], total_chunks)
-                            break
+                    else:
+                        # Timeout - retry
+                        retries[chunk_index] += 1
+                        logger.warning(
+                            f"Resending chunk {chunk_index} (attempt {retries[chunk_index] + 1}) for {transfer_id}")
 
-                    # Timeout - retry
-                    retries[chunk_index] += 1
-                    logger.warning(
-                        f"Resending chunk {chunk_index} (attempt {retries[chunk_index] + 1}) for {transfer_id}")
-
-                else:  # exceeded retries
+                if not success:  # exceeded retries
                     logger.error(f"Transfer {transfer_id} failed - giving up on chunk {chunk_index}")
                     with self.lock:
                         tf["status"] = "failed"
                     return
+
+                # Move to next chunk only after current chunk succeeded
+                chunk_index += 1
 
         # All chunks ACKed - send FILE_END
         self._send_json({"type": FILE_END, "transfer_id": transfer_id}, peer_addr)
@@ -333,7 +342,7 @@ class FileTransfer:
                 tf["end_time"] = time.time()
                 dur = tf["end_time"] - tf["start_time"]
                 speed = tf["file_size"] / dur / 1024 if dur else 0
-                logger.info("Upload of %s completed – %.2f KB/s", tf["file_name"], speed)
+                logger.info("Upload of %s completed – %.2f KB/s", tf["file_name"], speed)
             else:
                 tf["status"] = "failed"
                 logger.error("Transfer %s failed – no FILE_END_ACK", transfer_id)
